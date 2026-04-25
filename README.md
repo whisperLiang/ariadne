@@ -114,6 +114,14 @@ By default, Ariadne treats the first dimension of the first tensor input as the
 symbolic batch dimension `B`. If an example trace uses batch size 4, tensors like
 `(4, 256, 14, 14)` are recorded as `("B", 256, 14, 14)`.
 
+When tracing from batch size 1, Ariadne performs prepare-time batch provenance
+probes inside `SplitSpec.dynamic_batch`. This avoids treating every literal `1`
+as batch, and it can recover affine batch-derived shapes such as `4*B` that
+appear in windowed attention and token reshapes. If PyTorch chooses a different
+aten decomposition for batch 1 than for larger batches, Ariadne prepares a
+structural batch variant during preparation and dispatches to that generated
+segment at runtime without re-tracing.
+
 At runtime, Ariadne materializes `B` from the actual input batch size, validates
 that it is inside `SplitSpec.dynamic_batch`, and checks that non-batch dimensions
 match the prepared boundary schema. The concrete batch size is intentionally not
@@ -149,6 +157,8 @@ batch size, split id, execution mode, and optional CUDA peak memory.
 - The default tracer uses `TorchDispatchMode` runtime interception and records the
   observed forward path.
 - Alias, mutation, RNG, FLOP, and memory metadata are intentionally lightweight.
-- Segment generation currently supports tensor boundaries from one observed path.
+- Segment generation currently supports tensor boundaries from prepared observed
+  paths, including a batch>1 structural variant when batch=1 tracing needs it.
 - Dynamic non-batch dimensions are reserved for future SplitSpec extensions.
-- Complex shape expressions beyond direct batch-size uses are still limited.
+- Shape expressions cover direct and affine batch-derived dimensions; more
+  complex non-affine shape arithmetic is still limited.

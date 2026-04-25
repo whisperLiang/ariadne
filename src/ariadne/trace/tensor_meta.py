@@ -12,19 +12,27 @@ import torch
 class ShapeExpr:
     """A tiny symbolic shape expression.
 
-    The first milestone only needs direct symbols such as ``B``. The class gives
-    shape-sensitive operations a typed extension point for future expressions.
+    ``expression`` names the driving symbol, usually ``B``. ``multiplier`` and
+    ``offset`` cover affine batch-derived dimensions such as ``4 * B`` that
+    appear when real models fold batch with token or window counts.
     """
 
     expression: str
+    multiplier: int = 1
+    offset: int = 0
 
     def materialize(self, symbols: dict[str, int]) -> int:
         if self.expression not in symbols:
             raise ValueError(f"Missing value for shape symbol {self.expression!r}.")
-        return symbols[self.expression]
+        return self.multiplier * symbols[self.expression] + self.offset
 
     def __str__(self) -> str:
-        return self.expression
+        if self.multiplier == 1 and self.offset == 0:
+            return self.expression
+        if self.offset == 0:
+            return f"{self.multiplier}*{self.expression}"
+        sign = "+" if self.offset > 0 else "-"
+        return f"{self.multiplier}*{self.expression}{sign}{abs(self.offset)}"
 
 
 Dimension: TypeAlias = int | str | ShapeExpr

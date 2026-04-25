@@ -55,7 +55,7 @@ def benchmark_yolo(*, iterations: int, warmup: int) -> list[TimingRow]:
         name="YOLOv8n",
         model=model,
         x=x,
-        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 1)),
+        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 2)),
         iterations=iterations,
         warmup=warmup,
     )
@@ -70,7 +70,7 @@ def benchmark_rfdetr(*, iterations: int, warmup: int) -> list[TimingRow]:
         x=x,
         split=SplitSpec(
             boundary="after:model.transformer.decoder.layers.0.norm3",
-            dynamic_batch=(1, 1),
+            dynamic_batch=(1, 2),
         ),
         iterations=iterations,
         warmup=warmup,

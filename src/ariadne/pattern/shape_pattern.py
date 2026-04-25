@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ariadne.trace.tensor_meta import Dimension, ShapeEnv, TensorMeta
+from ariadne.trace.tensor_meta import Dimension, ShapeEnv, ShapeExpr, TensorMeta
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,13 @@ class BoundaryTensorSpec:
                     raise ValueError(
                         f"Boundary tensor {self.label!r} dimension {index} has batch "
                         f"{actual_int}; expected payload batch {batch_size}."
+                    )
+            elif isinstance(expected, ShapeExpr):
+                expected_int = expected.materialize({shape_env.batch_symbol: batch_size})
+                if actual_int != expected_int:
+                    raise ValueError(
+                        f"Boundary tensor {self.label!r} dimension {index} is {actual_int}; "
+                        f"expected {expected_int} from {expected}."
                     )
             elif isinstance(expected, int) and actual_int != expected:
                 raise ValueError(

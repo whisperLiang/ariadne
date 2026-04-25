@@ -43,12 +43,14 @@ def run_yolo_smoke() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(x,),
-        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 1)),
+        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 2)),
     )
-    with torch.no_grad():
-        split_output = runtime.run_suffix(runtime.run_prefix(x))
-        direct_output = model(x)
-    assert_nested_close(split_output, direct_output)
+    for batch_size in (1, 2):
+        x_batch = torch.randn(batch_size, 3, 64, 64)
+        with torch.no_grad():
+            split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
+            direct_output = model(x_batch)
+        assert_nested_close(split_output, direct_output)
     print(f"YOLO smoke ok: split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}")
 
 
@@ -77,13 +79,15 @@ def run_rfdetr_smoke() -> None:
         example_inputs=(x,),
         split=SplitSpec(
             boundary="after:model.transformer.decoder.layers.0.norm3",
-            dynamic_batch=(1, 1),
+            dynamic_batch=(1, 2),
         ),
     )
-    with torch.no_grad():
-        split_output = runtime.run_suffix(runtime.run_prefix(x))
-        direct_output = model(x)
-    assert_nested_close(split_output, direct_output)
+    for batch_size in (1, 2):
+        x_batch = torch.randn(batch_size, 3, 128, 128)
+        with torch.no_grad():
+            split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
+            direct_output = model(x_batch)
+        assert_nested_close(split_output, direct_output)
     print(f"RF-DETR smoke ok: split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}")
 
 

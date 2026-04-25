@@ -9,9 +9,11 @@ but not full activation tensors.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from hashlib import sha256
 from typing import Any
+from weakref import ReferenceType, ref
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -20,6 +22,7 @@ from ariadne.trace.tensor_meta import (
     BufferRef,
     ParamRef,
     ShapeEnv,
+    ShapeExpr,
     TensorMeta,
     buffer_ref_from_tensor,
     param_ref_from_parameter,
@@ -101,7 +104,7 @@ class _Recorder(TorchDispatchMode):
         super().__init__()
         self.model = model
         self.shape_env = shape_env
-        self.tensor_to_node: dict[int, str] = {}
+        self.tensor_to_node: dict[int, tuple[ReferenceType[torch.Tensor], str]] = {}
         self.tensor_meta_by_node: dict[str, TensorMeta] = {}
         self.ops: list[CapturedOp] = []
         self.module_stack: list[str] = []
@@ -115,6 +118,12 @@ class _Recorder(TorchDispatchMode):
         )
         self.parameter_by_id = {id(parameter): parameter for parameter in model.parameters()}
         self.buffer_by_id = {id(buffer): buffer for buffer in model.buffers()}
+        self.meta_shape_env = ShapeEnv(
+            batch_symbol=shape_env.batch_symbol,
+            traced_batch_size=None,
+            dynamic_batch=shape_env.dynamic_batch,
+        )
+        self.output: Any = None
         self.input_node_names = self._register_inputs(inputs)
 
     def __torch_dispatch__(
@@ -126,8 +135,8 @@ class _Recorder(TorchDispatchMode):
     ) -> Any:
         kwargs = kwargs or {}
         target = _target_name(func)
-        args_template = self._canonicalize_shape_args(self._template(args), target)
-        kwargs_template = self._canonicalize_shape_args(self._template(kwargs), target)
+        args_template = self._template(args)
+        kwargs_template = self._template(kwargs)
         parents = tuple(dict.fromkeys(_node_refs(args_template) + _node_refs(kwargs_template)))
         result = func(*args, **kwargs)
         output_template, output_names, tensor_metas = self._register_outputs(result)
@@ -160,8 +169,11 @@ class _Recorder(TorchDispatchMode):
         def visit(value: Any, path: str) -> None:
             if isinstance(value, torch.Tensor):
                 node_name = path
-                self.tensor_to_node[id(value)] = node_name
-                self.tensor_meta_by_node[node_name] = tensor_meta_from_tensor(value, self.shape_env)
+                self._remember_tensor_node(value, node_name)
+                self.tensor_meta_by_node[node_name] = tensor_meta_from_tensor(
+                    value,
+                    self.meta_shape_env,
+                )
                 names.append(node_name)
             elif isinstance(value, (tuple, list)):
                 for index, item in enumerate(value):
@@ -183,8 +195,8 @@ class _Recorder(TorchDispatchMode):
                 node_name = f"node_{len(self.ops)}"
                 if output_names:
                     node_name = f"{node_name}_{len(output_names)}"
-                self.tensor_to_node[id(value)] = node_name
-                meta = tensor_meta_from_tensor(value, self.shape_env)
+                self._remember_tensor_node(value, node_name)
+                meta = tensor_meta_from_tensor(value, self.meta_shape_env)
                 self.tensor_meta_by_node[node_name] = meta
                 output_names.append(node_name)
                 tensor_metas[node_name] = meta
@@ -204,8 +216,9 @@ class _Recorder(TorchDispatchMode):
             return ParamArg(self.parameter_names_by_id[id(value)])
         if isinstance(value, torch.Tensor):
             tensor_id = id(value)
-            if tensor_id in self.tensor_to_node:
-                return NodeArg(self.tensor_to_node[tensor_id])
+            node_name = self._node_for_tensor(value)
+            if node_name is not None:
+                return NodeArg(node_name)
             if tensor_id in self.parameter_names_by_id:
                 return ParamArg(self.parameter_names_by_id[tensor_id])
             if tensor_id in self.buffer_names_by_id:
@@ -232,18 +245,19 @@ class _Recorder(TorchDispatchMode):
             )
         return value
 
-    def _canonicalize_shape_args(self, value: Any, target: str) -> Any:
-        if not _is_shape_sensitive(target) or self.shape_env.traced_batch_size is None:
-            return value
-        if isinstance(value, int) and value == self.shape_env.traced_batch_size:
-            return BatchDimArg(self.shape_env.batch_symbol)
-        if isinstance(value, tuple):
-            return tuple(self._canonicalize_shape_args(item, target) for item in value)
-        if isinstance(value, list):
-            return [self._canonicalize_shape_args(item, target) for item in value]
-        if isinstance(value, dict):
-            return {key: self._canonicalize_shape_args(item, target) for key, item in value.items()}
-        return value
+    def _remember_tensor_node(self, tensor: torch.Tensor, node_name: str) -> None:
+        self.tensor_to_node[id(tensor)] = (ref(tensor), node_name)
+
+    def _node_for_tensor(self, tensor: torch.Tensor) -> str | None:
+        tensor_id = id(tensor)
+        entry = self.tensor_to_node.get(tensor_id)
+        if entry is None:
+            return None
+        tensor_ref, node_name = entry
+        if tensor_ref() is tensor:
+            return node_name
+        del self.tensor_to_node[tensor_id]
+        return None
 
     def _param_refs(self, *templates: Any) -> tuple[ParamRef, ...]:
         names = tuple(dict.fromkeys(_param_refs(*templates)))
@@ -280,19 +294,53 @@ def trace_model_interception(
         traced_batch_size=traced_batch_size,
         dynamic_batch=dynamic_batch,
     )
-    recorder = _Recorder(model=model, shape_env=shape_env, inputs=inputs)
-    hooks = _install_module_stack_hooks(model, recorder)
+    buffer_snapshot = _snapshot_buffers(model)
+    rng_snapshot = _snapshot_rng()
     try:
-        with recorder:
-            output = model(*inputs)
+        recorder = _record_forward(model=model, shape_env=shape_env, inputs=inputs)
+        probe_batch = _choose_probe_batch(shape_env)
+        probe_recorder = None
+        if probe_batch is not None and traced_batch_size is not None:
+            probe_inputs = _make_probe_inputs(inputs, traced_batch_size, probe_batch)
+            probe_shape_env = ShapeEnv(
+                batch_symbol=batch_symbol,
+                traced_batch_size=probe_batch,
+                dynamic_batch=dynamic_batch,
+            )
+            probe_recorder = _record_forward(
+                model=model,
+                shape_env=probe_shape_env,
+                inputs=probe_inputs,
+            )
     finally:
-        for handle in hooks:
-            handle.remove()
+        _restore_buffers(model, buffer_snapshot)
+        _restore_rng(rng_snapshot)
 
-    output_template = recorder._template(output)
-    nodes = _build_trace_nodes(recorder, output_template)
+    probe_ops_by_index = _align_probe_ops(
+        recorder.ops,
+        probe_recorder.ops if probe_recorder else None,
+    )
+    probe_meta_by_node = _probe_meta_by_node(
+        recorder,
+        probe_recorder=probe_recorder,
+        probe_ops_by_index=probe_ops_by_index,
+    )
+    _canonicalize_tensor_metas(
+        recorder,
+        probe_meta_by_node=probe_meta_by_node,
+        shape_env=shape_env,
+        probe_batch=probe_batch,
+    )
+    ops = _canonicalize_ops(
+        recorder,
+        probe_ops_by_index=probe_ops_by_index,
+        shape_env=shape_env,
+        probe_batch=probe_batch,
+    )
+    output_template = recorder._template(recorder.output)
+    nodes = _build_trace_nodes(recorder, ops, output_template)
     artifact = InterceptionTraceArtifact(
-        ops=tuple(recorder.ops),
+        ops=ops,
         output_template=output_template,
         input_node_names=recorder.input_node_names,
         parameter_names_by_id=recorder.parameter_names_by_id,
@@ -317,7 +365,140 @@ def trace_model_interception(
     )
 
 
-def _build_trace_nodes(recorder: _Recorder, output_template: Any) -> tuple[TraceNode, ...]:
+def _record_forward(
+    *,
+    model: torch.nn.Module,
+    shape_env: ShapeEnv,
+    inputs: tuple[Any, ...],
+) -> _Recorder:
+    recorder = _Recorder(model=model, shape_env=shape_env, inputs=inputs)
+    hooks = _install_module_stack_hooks(model, recorder)
+    try:
+        with recorder:
+            recorder.output = model(*inputs)
+    finally:
+        for handle in hooks:
+            handle.remove()
+    return recorder
+
+
+def _canonicalize_tensor_metas(
+    recorder: _Recorder,
+    *,
+    probe_meta_by_node: dict[str, TensorMeta],
+    shape_env: ShapeEnv,
+    probe_batch: int | None,
+) -> None:
+    for name, meta in tuple(recorder.tensor_meta_by_node.items()):
+        symbolic_shape = _symbolic_shape_for_node(
+            name,
+            meta,
+            recorder=recorder,
+            probe_meta_by_node=probe_meta_by_node,
+            shape_env=shape_env,
+            probe_batch=probe_batch,
+        )
+        recorder.tensor_meta_by_node[name] = replace(meta, symbolic_shape=symbolic_shape)
+
+
+def _symbolic_shape_for_node(
+    name: str,
+    meta: TensorMeta,
+    *,
+    recorder: _Recorder,
+    probe_meta_by_node: dict[str, TensorMeta],
+    shape_env: ShapeEnv,
+    probe_batch: int | None,
+) -> tuple[Any, ...]:
+    traced_batch = shape_env.traced_batch_size
+    if traced_batch is None or not meta.shape or meta.shape[0] != traced_batch:
+        return meta.shape
+    if name in recorder.input_node_names:
+        return (shape_env.batch_symbol, *meta.shape[1:])
+    if probe_batch is not None:
+        probe_meta = probe_meta_by_node.get(name)
+        if probe_meta is not None and len(probe_meta.shape) == len(meta.shape):
+            return tuple(
+                _symbolic_dimension(
+                    value,
+                    probe_value,
+                    traced_batch=traced_batch,
+                    probe_batch=probe_batch,
+                    symbol=shape_env.batch_symbol,
+                )
+                for value, probe_value in zip(meta.shape, probe_meta.shape, strict=True)
+            )
+        return meta.shape
+    if traced_batch != 1:
+        return (shape_env.batch_symbol, *meta.shape[1:])
+    return meta.shape
+
+
+def _canonicalize_ops(
+    recorder: _Recorder,
+    *,
+    probe_ops_by_index: tuple[CapturedOp | None, ...],
+    shape_env: ShapeEnv,
+    probe_batch: int | None,
+) -> tuple[CapturedOp, ...]:
+    ops: list[CapturedOp] = []
+    for index, op in enumerate(recorder.ops):
+        args_template = op.args_template
+        kwargs_template = op.kwargs_template
+        if _is_shape_sensitive(op.target):
+            probe_op = probe_ops_by_index[index]
+            if probe_op is not None and probe_batch is not None:
+                arg_exprs = _batch_exprs(
+                    op.args_template,
+                    probe_op.args_template,
+                    traced_batch=shape_env.traced_batch_size,
+                    probe_batch=probe_batch,
+                    symbol=shape_env.batch_symbol,
+                )
+                kwarg_exprs = _batch_exprs(
+                    op.kwargs_template,
+                    probe_op.kwargs_template,
+                    traced_batch=shape_env.traced_batch_size,
+                    probe_batch=probe_batch,
+                    symbol=shape_env.batch_symbol,
+                )
+                args_template = _replace_batch_exprs(
+                    op.args_template,
+                    arg_exprs,
+                )
+                kwargs_template = _replace_batch_exprs(
+                    op.kwargs_template,
+                    kwarg_exprs,
+                )
+            elif shape_env.traced_batch_size is not None and shape_env.traced_batch_size != 1:
+                args_template = _replace_matching_batch_constants(
+                    op.args_template,
+                    shape_env.traced_batch_size,
+                    shape_env.batch_symbol,
+                )
+                kwargs_template = _replace_matching_batch_constants(
+                    op.kwargs_template,
+                    shape_env.traced_batch_size,
+                    shape_env.batch_symbol,
+                )
+        ops.append(
+            replace(
+                op,
+                args_template=args_template,
+                kwargs_template=kwargs_template,
+                tensor_metas={
+                    name: recorder.tensor_meta_by_node[name] for name in op.output_names
+                },
+            )
+        )
+    return tuple(ops)
+
+
+def _build_trace_nodes(
+    recorder: _Recorder,
+    ops: tuple[CapturedOp, ...],
+    output_template: Any,
+) -> tuple[TraceNode, ...]:
     nodes: list[TraceNode] = []
     for name in recorder.input_node_names:
         nodes.append(
@@ -331,7 +512,7 @@ def _build_trace_nodes(recorder: _Recorder, output_template: Any) -> tuple[Trace
                 tensor_meta=recorder.tensor_meta_by_node[name],
             )
         )
-    for op in recorder.ops:
+    for op in ops:
         for output_name in op.output_names:
             nodes.append(
                 TraceNode(
@@ -386,6 +567,248 @@ def _install_module_stack_hooks(
     return handles
 
 
+def _align_probe_ops(
+    ops: list[CapturedOp],
+    probe_ops: list[CapturedOp] | None,
+) -> tuple[CapturedOp | None, ...]:
+    if probe_ops is None:
+        return tuple(None for _ in ops)
+    if len(ops) == len(probe_ops) and all(
+        _op_alignment_key(op) == _op_alignment_key(probe_op)
+        for op, probe_op in zip(ops, probe_ops, strict=True)
+    ):
+        return tuple(probe_ops)
+
+    aligned: list[CapturedOp | None] = [None for _ in ops]
+    matcher = SequenceMatcher(
+        None,
+        [_op_alignment_key(op) for op in ops],
+        [_op_alignment_key(op) for op in probe_ops],
+        autojunk=False,
+    )
+    for match in matcher.get_matching_blocks():
+        for offset in range(match.size):
+            aligned[match.a + offset] = probe_ops[match.b + offset]
+    return tuple(aligned)
+
+
+def _probe_meta_by_node(
+    recorder: _Recorder,
+    *,
+    probe_recorder: _Recorder | None,
+    probe_ops_by_index: tuple[CapturedOp | None, ...],
+) -> dict[str, TensorMeta]:
+    if probe_recorder is None:
+        return {}
+    metas: dict[str, TensorMeta] = {}
+    for name in recorder.input_node_names:
+        probe_meta = probe_recorder.tensor_meta_by_node.get(name)
+        if probe_meta is not None:
+            metas[name] = probe_meta
+    for op, probe_op in zip(recorder.ops, probe_ops_by_index, strict=True):
+        if probe_op is None or len(op.output_names) != len(probe_op.output_names):
+            continue
+        for output_name, probe_output_name in zip(
+            op.output_names,
+            probe_op.output_names,
+            strict=True,
+        ):
+            probe_meta = probe_op.tensor_metas.get(probe_output_name)
+            if probe_meta is not None:
+                metas[output_name] = probe_meta
+    return metas
+
+
+def _op_alignment_key(op: CapturedOp) -> tuple[str, str | None]:
+    return op.target, op.module_path
+
+
+def _batch_exprs(
+    value: Any,
+    probe_value: Any,
+    *,
+    traced_batch: int | None,
+    probe_batch: int,
+    symbol: str,
+    path: tuple[Any, ...] = (),
+) -> dict[tuple[Any, ...], BatchDimArg | ShapeExpr]:
+    if traced_batch is None:
+        return {}
+    if type(value) is int and type(probe_value) is int:
+        expression = _template_expression_for_values(
+            value,
+            probe_value,
+            traced_batch=traced_batch,
+            probe_batch=probe_batch,
+            symbol=symbol,
+        )
+        return {} if expression is None else {path: expression}
+    expressions: dict[tuple[Any, ...], BatchDimArg | ShapeExpr] = {}
+    if (
+        isinstance(value, (tuple, list))
+        and isinstance(probe_value, type(value))
+        and len(value) == len(probe_value)
+    ):
+        for index, (item, probe_item) in enumerate(zip(value, probe_value, strict=True)):
+            expressions.update(
+                _batch_exprs(
+                    item,
+                    probe_item,
+                    traced_batch=traced_batch,
+                    probe_batch=probe_batch,
+                    symbol=symbol,
+                    path=(*path, index),
+                )
+            )
+    elif isinstance(value, dict) and isinstance(probe_value, dict):
+        for key in value.keys() & probe_value.keys():
+            expressions.update(
+                _batch_exprs(
+                    value[key],
+                    probe_value[key],
+                    traced_batch=traced_batch,
+                    probe_batch=probe_batch,
+                    symbol=symbol,
+                    path=(*path, key),
+                )
+            )
+    elif isinstance(value, slice) and isinstance(probe_value, slice):
+        for attr in ("start", "stop", "step"):
+            expressions.update(
+                _batch_exprs(
+                    getattr(value, attr),
+                    getattr(probe_value, attr),
+                    traced_batch=traced_batch,
+                    probe_batch=probe_batch,
+                    symbol=symbol,
+                    path=(*path, attr),
+                )
+            )
+    return expressions
+
+
+def _replace_batch_exprs(
+    value: Any,
+    expressions: dict[tuple[Any, ...], BatchDimArg | ShapeExpr],
+    *,
+    path: tuple[Any, ...] = (),
+) -> Any:
+    if path in expressions and type(value) is int:
+        return expressions[path]
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_batch_exprs(item, expressions, path=(*path, index))
+            for index, item in enumerate(value)
+        )
+    if isinstance(value, list):
+        return [
+            _replace_batch_exprs(item, expressions, path=(*path, index))
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _replace_batch_exprs(item, expressions, path=(*path, key))
+            for key, item in value.items()
+        }
+    if isinstance(value, slice):
+        return slice(
+            _replace_batch_exprs(value.start, expressions, path=(*path, "start")),
+            _replace_batch_exprs(value.stop, expressions, path=(*path, "stop")),
+            _replace_batch_exprs(value.step, expressions, path=(*path, "step")),
+        )
+    return value
+
+
+def _symbolic_dimension(
+    value: int,
+    probe_value: int,
+    *,
+    traced_batch: int | None,
+    probe_batch: int,
+    symbol: str,
+) -> int | str | ShapeExpr:
+    if value == probe_value:
+        return value
+    expression = _shape_expression_for_values(
+        value,
+        probe_value,
+        traced_batch=traced_batch,
+        probe_batch=probe_batch,
+        symbol=symbol,
+    )
+    if expression is None:
+        return value
+    if expression.multiplier == 1 and expression.offset == 0:
+        return symbol
+    return expression
+
+
+def _template_expression_for_values(
+    value: int,
+    probe_value: int,
+    *,
+    traced_batch: int,
+    probe_batch: int,
+    symbol: str,
+) -> BatchDimArg | ShapeExpr | None:
+    expression = _shape_expression_for_values(
+        value,
+        probe_value,
+        traced_batch=traced_batch,
+        probe_batch=probe_batch,
+        symbol=symbol,
+    )
+    if expression is None:
+        return None
+    if expression.multiplier == 1 and expression.offset == 0:
+        return BatchDimArg(symbol)
+    return expression
+
+
+def _shape_expression_for_values(
+    value: int,
+    probe_value: int,
+    *,
+    traced_batch: int | None,
+    probe_batch: int,
+    symbol: str,
+) -> ShapeExpr | None:
+    if traced_batch is None or probe_batch == traced_batch:
+        return None
+    delta_batch = probe_batch - traced_batch
+    delta_value = probe_value - value
+    if delta_value == 0 or delta_value % delta_batch != 0:
+        return None
+    multiplier = delta_value // delta_batch
+    offset = value - multiplier * traced_batch
+    if multiplier == 0 or multiplier * probe_batch + offset != probe_value:
+        return None
+    return ShapeExpr(symbol, multiplier=multiplier, offset=offset)
+
+
+def _replace_matching_batch_constants(value: Any, traced_batch: int, symbol: str) -> Any:
+    if type(value) is int and value == traced_batch:
+        return BatchDimArg(symbol)
+    if isinstance(value, tuple):
+        return tuple(
+            _replace_matching_batch_constants(item, traced_batch, symbol) for item in value
+        )
+    if isinstance(value, list):
+        return [_replace_matching_batch_constants(item, traced_batch, symbol) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_matching_batch_constants(item, traced_batch, symbol)
+            for key, item in value.items()
+        }
+    if isinstance(value, slice):
+        return slice(
+            _replace_matching_batch_constants(value.start, traced_batch, symbol),
+            _replace_matching_batch_constants(value.stop, traced_batch, symbol),
+            _replace_matching_batch_constants(value.step, traced_batch, symbol),
+        )
+    return value
+
+
 def resolve_template(
     value: Any,
     *,
@@ -408,6 +831,11 @@ def resolve_template(
         return value.value
     if isinstance(value, BatchDimArg):
         return env[value.symbol]
+    if isinstance(value, ShapeExpr):
+        symbol_value = env.get(value.expression)
+        if not isinstance(symbol_value, int):
+            raise ValueError(f"Missing shape symbol {value.expression!r} in runtime env.")
+        return value.materialize({value.expression: symbol_value})
     if isinstance(value, tuple):
         return tuple(
             resolve_template(item, env=env, parameters=parameters, buffers=buffers, root=root)
@@ -512,6 +940,81 @@ def _buffer_refs(*values: Any) -> list[str]:
         elif isinstance(value, slice):
             refs.extend(_buffer_refs(value.start, value.stop, value.step))
     return refs
+
+
+def _choose_probe_batch(shape_env: ShapeEnv) -> int | None:
+    traced_batch = shape_env.traced_batch_size
+    if traced_batch is None or shape_env.dynamic_batch is None:
+        return None
+    low, high = shape_env.dynamic_batch
+    if traced_batch == 1 and low <= 2 <= high:
+        return 2
+    if traced_batch != 1:
+        next_batch = traced_batch + 1
+        if low <= next_batch <= high:
+            return next_batch
+        if low <= 2 <= high and traced_batch != 2:
+            return 2
+        if low <= 1 <= high:
+            return 1
+    if low <= high and low != traced_batch:
+        return low
+    if high != traced_batch:
+        return high
+    return None
+
+
+def _make_probe_inputs(value: Any, traced_batch: int, probe_batch: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and int(value.shape[0]) == traced_batch:
+            return _resize_tensor_batch(value, probe_batch)
+        return value.detach().clone()
+    if isinstance(value, tuple):
+        return tuple(_make_probe_inputs(item, traced_batch, probe_batch) for item in value)
+    if isinstance(value, list):
+        return [_make_probe_inputs(item, traced_batch, probe_batch) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _make_probe_inputs(item, traced_batch, probe_batch)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _resize_tensor_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if int(tensor.shape[0]) >= batch_size:
+        resized = tensor[:batch_size].detach().clone()
+    else:
+        repeats = [1 for _ in tensor.shape]
+        repeats[0] = (batch_size + int(tensor.shape[0]) - 1) // int(tensor.shape[0])
+        resized = tensor.repeat(*repeats)[:batch_size].detach().clone()
+    if tensor.requires_grad and (resized.is_floating_point() or resized.is_complex()):
+        resized.requires_grad_(True)
+    return resized
+
+
+def _snapshot_buffers(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+
+
+def _restore_buffers(model: torch.nn.Module, snapshot: dict[str, torch.Tensor]) -> None:
+    buffers = dict(model.named_buffers())
+    for name, saved in snapshot.items():
+        if name in buffers and buffers[name].shape == saved.shape:
+            buffers[name].detach().copy_(saved)
+
+
+def _snapshot_rng() -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+    cpu_state = torch.random.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    return cpu_state, cuda_state
+
+
+def _restore_rng(snapshot: tuple[torch.Tensor, list[torch.Tensor] | None]) -> None:
+    cpu_state, cuda_state = snapshot
+    torch.random.set_rng_state(cpu_state)
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
 
 
 def _tensor_attr_names_by_id(

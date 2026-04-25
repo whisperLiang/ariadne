@@ -14,6 +14,7 @@ from ariadne.pattern.split_spec import SplitSpec
 from ariadne.planner.frontier import SplitCandidate
 from ariadne.runtime.boundary import BoundaryPayload, validate_boundary_payload
 from ariadne.runtime.train_runtime import backward_prefix, train_suffix
+from ariadne.trace.tensor_meta import ShapeExpr
 from ariadne.trace.trace_plan import TracePlan
 
 BoundaryGradients = dict[str, torch.Tensor | None]
@@ -28,6 +29,8 @@ class SplitRuntime:
     candidate: SplitCandidate
     segments: SegmentBundle
     mode: Literal["debug_interpreter", "generated_eager", "compiled"] = "generated_eager"
+    variants: tuple[SplitRuntime, ...] = ()
+    batch_range: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.mode == "debug_interpreter":
@@ -46,6 +49,11 @@ class SplitRuntime:
         return self.trace_plan.graph_signature
 
     def run_prefix(self, *inputs: Any) -> BoundaryPayload:
+        batch_size = self._batch_size_from_inputs(inputs)
+        variant = self._variant_for_batch(batch_size)
+        if variant is not None:
+            return variant.run_prefix(*inputs)
+
         self._validate_inputs(inputs)
         boundary_values = _as_tuple(self.prefix_segment(*inputs))
         tensors = {
@@ -57,7 +65,6 @@ class SplitRuntime:
             label: inputs[self.trace_plan.input_node_names.index(label)]
             for label in self.segments.passthrough_order
         }
-        batch_size = self._batch_size_from_inputs(inputs)
         return BoundaryPayload(
             split_id=self.split_id,
             graph_signature=self.graph_signature,
@@ -69,6 +76,10 @@ class SplitRuntime:
         )
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
+        variant = self._variant_for_boundary(boundary)
+        if variant is not None:
+            return variant.run_suffix(boundary)
+
         self.validate_boundary(boundary)
         suffix_inputs = self._suffix_inputs(boundary)
         return self.suffix_segment(*suffix_inputs)
@@ -81,6 +92,10 @@ class SplitRuntime:
         loss_fn: Callable[[Any, Any], torch.Tensor] | None = None,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> tuple[torch.Tensor, BoundaryGradients]:
+        variant = self._variant_for_boundary(boundary)
+        if variant is not None:
+            return variant.train_suffix(boundary, targets, loss_fn=loss_fn, optimizer=optimizer)
+
         return train_suffix(
             self,
             boundary,
@@ -96,6 +111,12 @@ class SplitRuntime:
         optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
         raw_inputs, grads = _normalize_backward_prefix_args(inputs, boundary_grads)
+        batch_size = self._batch_size_from_inputs(raw_inputs)
+        variant = self._variant_for_batch(batch_size)
+        if variant is not None:
+            variant.backward_prefix(*raw_inputs, boundary_grads=grads, optimizer=optimizer)
+            return
+
         backward_prefix(self, raw_inputs, grads, optimizer=optimizer)
 
     def validate_boundary(self, boundary: BoundaryPayload) -> None:
@@ -131,6 +152,16 @@ class SplitRuntime:
             ):
                 if expected == self.trace_plan.shape_env.batch_symbol:
                     continue
+                if isinstance(expected, ShapeExpr):
+                    expected_int = expected.materialize(
+                        {self.trace_plan.shape_env.batch_symbol: batch_size}
+                    )
+                    if int(actual) != expected_int:
+                        raise ValueError(
+                            f"Input {index} dimension {dim_index} is {int(actual)}; "
+                            f"expected {expected_int} from {expected}."
+                        )
+                    continue
                 if isinstance(expected, int) and int(actual) != expected:
                     raise ValueError(
                         f"Input {index} dimension {dim_index} is {int(actual)}; "
@@ -142,6 +173,27 @@ class SplitRuntime:
             if isinstance(value, torch.Tensor) and value.ndim > 0:
                 return int(value.shape[0])
         raise ValueError("Ariadne requires at least one batched tensor input.")
+
+    def _variant_for_batch(self, batch_size: int) -> SplitRuntime | None:
+        for variant in self.variants:
+            if variant._matches_batch(batch_size):
+                return variant
+        return None
+
+    def _variant_for_boundary(self, boundary: BoundaryPayload) -> SplitRuntime | None:
+        for variant in self.variants:
+            if (
+                boundary.graph_signature == variant.graph_signature
+                and boundary.split_id == variant.split_id
+            ):
+                return variant
+        return None
+
+    def _matches_batch(self, batch_size: int) -> bool:
+        if self.batch_range is None:
+            return False
+        low, high = self.batch_range
+        return low <= batch_size <= high
 
 
 def _as_tuple(value: Any) -> tuple[Any, ...]:
