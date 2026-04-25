@@ -31,6 +31,55 @@ def assert_nested_close(left: Any, right: Any, *, path: str = "root") -> None:
         raise AssertionError(f"{path}: value mismatch")
 
 
+def nested_tensor_loss(value: Any) -> torch.Tensor:
+    terms = list(_iter_loss_terms(value))
+    if not terms:
+        raise TypeError("Expected at least one floating tensor output for differentiable loss.")
+    loss = terms[0]
+    for term in terms[1:]:
+        loss = loss + term
+    return loss
+
+
+def assert_split_train_equivalent(
+    model: nn.Module,
+    runtime: Any,
+    x: torch.Tensor,
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> None:
+    model.zero_grad(set_to_none=True)
+    direct_inputs = x.detach().clone().requires_grad_(True)
+    direct_loss = nested_tensor_loss(model(direct_inputs))
+    direct_loss.backward()
+    direct_grads = {
+        name: None if parameter.grad is None else parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+
+    model.zero_grad(set_to_none=True)
+    split_inputs = x.detach().clone().requires_grad_(True)
+    boundary = runtime.run_prefix(split_inputs)
+    split_loss, boundary_grads = runtime.train_suffix(
+        boundary,
+        None,
+        loss_fn=lambda outputs, _targets: nested_tensor_loss(outputs),
+    )
+    runtime.backward_prefix(split_inputs, boundary_grads=boundary_grads)
+
+    torch.testing.assert_close(split_loss, direct_loss.detach(), rtol=rtol, atol=atol)
+    for name, parameter in model.named_parameters():
+        expected = direct_grads[name]
+        actual = parameter.grad
+        if expected is None and actual is None:
+            continue
+        if expected is None or actual is None:
+            raise AssertionError(f"Gradient presence mismatch for parameter {name!r}.")
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    model.zero_grad(set_to_none=True)
+
+
 def run_yolo_smoke() -> None:
     from ultralytics import YOLO
 
@@ -39,19 +88,28 @@ def run_yolo_smoke() -> None:
     with _pushd(weights_dir):
         yolo = YOLO("yolov8n.pt")
     model = yolo.model.eval()
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(2, 3, 64, 64)
     runtime = prepare_split(
         model,
         example_inputs=(x,),
-        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 2)),
+        split=SplitSpec(
+            boundary="after:model.2",
+            dynamic_batch=(2, 3),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
-    for batch_size in (1, 2):
+    for batch_size in (2, 3):
         x_batch = torch.randn(batch_size, 3, 64, 64)
         with torch.no_grad():
             split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
             direct_output = model(x_batch)
         assert_nested_close(split_output, direct_output)
-    print(f"YOLO smoke ok: split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}")
+    assert_split_train_equivalent(model, runtime, torch.randn(3, 3, 64, 64))
+    print(
+        "YOLO batch_gt1 ok: "
+        f"split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}"
+    )
 
 
 class RFDETRTensorWrapper(nn.Module):
@@ -73,22 +131,28 @@ class RFDETRTensorWrapper(nn.Module):
 
 def run_rfdetr_smoke() -> None:
     model = RFDETRTensorWrapper().eval()
-    x = torch.randn(1, 3, 128, 128)
+    x = torch.randn(2, 3, 128, 128)
     runtime = prepare_split(
         model,
         example_inputs=(x,),
         split=SplitSpec(
             boundary="after:model.transformer.decoder.layers.0.norm3",
-            dynamic_batch=(1, 2),
+            dynamic_batch=(2, 3),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
         ),
     )
-    for batch_size in (1, 2):
+    for batch_size in (2, 3):
         x_batch = torch.randn(batch_size, 3, 128, 128)
         with torch.no_grad():
             split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
             direct_output = model(x_batch)
         assert_nested_close(split_output, direct_output)
-    print(f"RF-DETR smoke ok: split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}")
+    assert_split_train_equivalent(model, runtime, torch.randn(3, 3, 128, 128))
+    print(
+        "RF-DETR batch_gt1 ok: "
+        f"split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}"
+    )
 
 
 @contextlib.contextmanager
@@ -109,3 +173,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _iter_loss_terms(value: Any) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        if value.is_floating_point() or value.is_complex():
+            return [value.float().square().mean()]
+        return []
+    if isinstance(value, (tuple, list)):
+        return [term for item in value for term in _iter_loss_terms(item)]
+    if isinstance(value, dict):
+        return [term for item in value.values() for term in _iter_loss_terms(item)]
+    return []

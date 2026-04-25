@@ -31,7 +31,12 @@ def test_split_training_matches_full_backward() -> None:
     runtime = prepare_split(
         split_model,
         example_inputs=(x_split,),
-        split=SplitSpec(boundary="after:act", trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     assert_gradient_equivalent(
@@ -51,7 +56,12 @@ def test_backward_prefix_accepts_prompt_style_positional_gradients() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(x,),
-        split=SplitSpec(boundary="after:act", trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     boundary = runtime.run_prefix(x)

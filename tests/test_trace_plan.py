@@ -19,7 +19,12 @@ class TinyNet(nn.Module):
 
 def test_trace_plan_captures_nodes_and_symbolic_batch() -> None:
     model = TinyNet()
-    plan = trace_model(model, example_inputs=(torch.randn(4, 5),), dynamic_batch=(1, 16))
+    plan = trace_model(
+        model,
+        example_inputs=(torch.randn(4, 5),),
+        dynamic_batch=(2, 16),
+        trace_batch_mode="batch_gt1",
+    )
 
     assert plan.shape_env.traced_batch_size == 4
     assert plan.input_metas[0] is not None

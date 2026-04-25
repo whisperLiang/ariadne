@@ -50,12 +50,16 @@ def benchmark_yolo(*, iterations: int, warmup: int) -> list[TimingRow]:
     with _pushd(weights_dir):
         yolo = YOLO("yolov8n.pt")
     model = yolo.model.eval()
-    x = torch.randn(1, 3, 64, 64)
+    x = torch.randn(2, 3, 64, 64)
     return _benchmark_model(
         name="YOLOv8n",
         model=model,
         x=x,
-        split=SplitSpec(boundary="after:model.2", dynamic_batch=(1, 2)),
+        split=SplitSpec(
+            boundary="after:model.2",
+            dynamic_batch=(2, 3),
+            trace_batch_mode="batch_gt1",
+        ),
         iterations=iterations,
         warmup=warmup,
     )
@@ -63,14 +67,15 @@ def benchmark_yolo(*, iterations: int, warmup: int) -> list[TimingRow]:
 
 def benchmark_rfdetr(*, iterations: int, warmup: int) -> list[TimingRow]:
     model = RFDETRTensorWrapper().eval()
-    x = torch.randn(1, 3, 128, 128)
+    x = torch.randn(2, 3, 128, 128)
     return _benchmark_model(
         name="RF-DETR Nano",
         model=model,
         x=x,
         split=SplitSpec(
             boundary="after:model.transformer.decoder.layers.0.norm3",
-            dynamic_batch=(1, 2),
+            dynamic_batch=(2, 3),
+            trace_batch_mode="batch_gt1",
         ),
         iterations=iterations,
         warmup=warmup,

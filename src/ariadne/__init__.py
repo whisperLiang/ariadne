@@ -1,11 +1,11 @@
 """Public package interface for Ariadne."""
 
 from ariadne.api import prepare_split
-from ariadne.pattern.split_spec import SplitSpec
+from ariadne.pattern.split_spec import SplitSpec, TraceBatchMode
 from ariadne.runtime.boundary import BoundaryPayload
 from ariadne.runtime.segment_runtime import SplitRuntime
 
-__all__ = ["BoundaryPayload", "SplitRuntime", "SplitSpec", "prepare_split"]
+__all__ = ["BoundaryPayload", "SplitRuntime", "SplitSpec", "TraceBatchMode", "prepare_split"]
 
 
 def main() -> None:

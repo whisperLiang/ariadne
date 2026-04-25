@@ -26,7 +26,12 @@ def main() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(x,),
-        split=SplitSpec(boundary="after:layer2", dynamic_batch=(1, 64), trainable=True),
+        split=SplitSpec(
+            boundary="after:layer2",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     suffix_optimizer = torch.optim.SGD(model.layer3.parameters(), lr=0.01)

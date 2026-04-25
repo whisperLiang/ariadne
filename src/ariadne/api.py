@@ -40,12 +40,14 @@ def prepare_split(
 
     spec = _normalize_split_spec(split)
     validate_split_spec(spec)
+    _validate_trace_batch_mode(spec, tuple(example_inputs))
 
     plan = trace_model(
         model,
         example_inputs=tuple(example_inputs),
         batch_symbol=spec.batch_symbol,
         dynamic_batch=spec.dynamic_batch,
+        trace_batch_mode=spec.trace_batch_mode,
     )
     runtime = _prepare_runtime_from_plan(
         plan,
@@ -116,7 +118,7 @@ def _prepare_batch_variants(
     mode: ExecutionMode,
     compile_options: Mapping[str, Any] | None,
 ) -> tuple[SplitRuntime, ...]:
-    if spec.dynamic_batch is None:
+    if spec.trace_batch_mode != "batch_1" or spec.dynamic_batch is None:
         return ()
     traced_batch = _first_batch_size(example_inputs)
     if traced_batch != 1:
@@ -133,6 +135,7 @@ def _prepare_batch_variants(
         example_inputs=variant_inputs,
         batch_symbol=spec.batch_symbol,
         dynamic_batch=spec.dynamic_batch,
+        trace_batch_mode=spec.trace_batch_mode,
     )
     return (
         _prepare_runtime_from_plan(
@@ -195,3 +198,13 @@ def _resize_tensor_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
     if tensor.requires_grad and (resized.is_floating_point() or resized.is_complex()):
         resized.requires_grad_(True)
     return resized
+
+
+def _validate_trace_batch_mode(spec: SplitSpec, example_inputs: tuple[Any, ...]) -> None:
+    traced_batch = _first_batch_size(example_inputs)
+    if traced_batch is None:
+        raise ValueError("Ariadne requires at least one tensor input with a batch dimension.")
+    if spec.trace_batch_mode == "batch_1" and traced_batch != 1:
+        raise ValueError("batch_1 mode requires example_inputs to use batch size 1.")
+    if spec.trace_batch_mode == "batch_gt1" and traced_batch <= 1:
+        raise ValueError("batch_gt1 mode requires example_inputs to use batch size greater than 1.")

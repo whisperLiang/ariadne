@@ -24,7 +24,12 @@ def test_generated_eager_forward_matches_direct_model() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(4, 5),),
-        split=SplitSpec(boundary="after:act", trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     assert_forward_equivalent(model, runtime, (torch.randn(6, 5),))
@@ -35,7 +40,12 @@ def test_boundary_only_suffix_is_deterministic_for_same_payload() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(4, 5),),
-        split=SplitSpec(boundary="after:act", trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     boundary = runtime.run_prefix(torch.randn(4, 5))
@@ -50,7 +60,12 @@ def test_boundary_validation_rejects_missing_label_and_wrong_static_dim() -> Non
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(4, 5),),
-        split=SplitSpec(boundary="after:act", trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
     boundary = runtime.run_prefix(torch.randn(4, 5))
     label = next(iter(boundary.tensors))

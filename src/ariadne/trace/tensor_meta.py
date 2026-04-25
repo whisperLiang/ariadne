@@ -45,6 +45,7 @@ class ShapeEnv:
     batch_symbol: str = "B"
     traced_batch_size: int | None = None
     dynamic_batch: tuple[int, int] | None = None
+    trace_batch_mode: str = "batch_1"
 
     def canonicalize_shape(self, shape: tuple[int, ...]) -> tuple[Dimension, ...]:
         if self.traced_batch_size is None or not shape:

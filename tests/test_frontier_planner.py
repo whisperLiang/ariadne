@@ -21,9 +21,22 @@ class TinyNet(nn.Module):
 
 
 def test_frontier_planner_selects_named_module_boundary() -> None:
-    plan = trace_model(TinyNet(), example_inputs=(torch.randn(4, 5),))
+    plan = trace_model(
+        TinyNet(),
+        example_inputs=(torch.randn(4, 5),),
+        dynamic_batch=(2, 16),
+        trace_batch_mode="batch_gt1",
+    )
 
-    candidate = select_split(plan, split=SplitSpec(boundary="after:act", trainable=True))
+    candidate = select_split(
+        plan,
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 16),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
 
     assert len(candidate.boundary_nodes) == 1
     assert candidate.trainable_suffix
@@ -31,7 +44,12 @@ def test_frontier_planner_selects_named_module_boundary() -> None:
 
 
 def test_auto_split_returns_lowest_boundary_candidate() -> None:
-    plan = trace_model(TinyNet(), example_inputs=(torch.randn(4, 5),))
+    plan = trace_model(
+        TinyNet(),
+        example_inputs=(torch.randn(4, 5),),
+        dynamic_batch=(2, 16),
+        trace_batch_mode="batch_gt1",
+    )
 
     candidate = select_split(
         plan,

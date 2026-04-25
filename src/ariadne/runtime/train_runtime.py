@@ -27,10 +27,13 @@ def train_suffix(
         optimizer.zero_grad(set_to_none=True)
 
     detached_tensors: dict[str, torch.Tensor] = {}
+    grad_roots: dict[str, torch.Tensor] = {}
     for label in runtime.segments.boundary_order:
         tensor = boundary.tensors[label].detach()
         if tensor.is_floating_point() or tensor.is_complex():
-            tensor = tensor.requires_grad_(True)
+            grad_root = tensor.requires_grad_(True)
+            grad_roots[label] = grad_root
+            tensor = grad_root.clone()
         detached_tensors[label] = tensor
 
     detached_boundary = BoundaryPayload(
@@ -51,9 +54,9 @@ def train_suffix(
         optimizer.step()
 
     grads = {
-        label: detached_tensors[label].grad
+        label: grad_roots[label].grad
         for label in runtime.segments.boundary_order
-        if detached_tensors[label].requires_grad
+        if label in grad_roots
     }
     return loss.detach(), grads
 

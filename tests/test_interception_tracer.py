@@ -29,7 +29,12 @@ def test_runtime_interception_records_real_python_branch_and_functional_ops() ->
     runtime = prepare_split(
         model,
         example_inputs=(x,),
-        split=SplitSpec(boundary="after:proj", dynamic_batch=(1, 8), trainable=True),
+        split=SplitSpec(
+            boundary="after:proj",
+            dynamic_batch=(2, 8),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
     assert isinstance(runtime.trace_plan.runtime_artifact, InterceptionTraceArtifact)

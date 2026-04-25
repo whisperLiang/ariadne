@@ -17,6 +17,7 @@ def trace_model(
     example_inputs: Sequence[Any],
     batch_symbol: str = "B",
     dynamic_batch: tuple[int, int] | None = None,
+    trace_batch_mode: str = "batch_1",
 ) -> TracePlan:
     """Trace a model by executing its real forward path under interception."""
     return trace_model_interception(
@@ -24,4 +25,5 @@ def trace_model(
         example_inputs=tuple(example_inputs),
         batch_symbol=batch_symbol,
         dynamic_batch=dynamic_batch,
+        trace_batch_mode=trace_batch_mode,
     )

@@ -122,6 +122,7 @@ class _Recorder(TorchDispatchMode):
             batch_symbol=shape_env.batch_symbol,
             traced_batch_size=None,
             dynamic_batch=shape_env.dynamic_batch,
+            trace_batch_mode=shape_env.trace_batch_mode,
         )
         self.output: Any = None
         self.input_node_names = self._register_inputs(inputs)
@@ -286,6 +287,7 @@ def trace_model_interception(
     example_inputs: Sequence[Any],
     batch_symbol: str = "B",
     dynamic_batch: tuple[int, int] | None = None,
+    trace_batch_mode: str = "batch_1",
 ) -> TracePlan:
     inputs = tuple(example_inputs)
     traced_batch_size = _infer_traced_batch_size(inputs)
@@ -293,6 +295,7 @@ def trace_model_interception(
         batch_symbol=batch_symbol,
         traced_batch_size=traced_batch_size,
         dynamic_batch=dynamic_batch,
+        trace_batch_mode=trace_batch_mode,
     )
     buffer_snapshot = _snapshot_buffers(model)
     rng_snapshot = _snapshot_rng()
@@ -306,6 +309,7 @@ def trace_model_interception(
                 batch_symbol=batch_symbol,
                 traced_batch_size=probe_batch,
                 dynamic_batch=dynamic_batch,
+                trace_batch_mode=trace_batch_mode,
             )
             probe_recorder = _record_forward(
                 model=model,
@@ -947,16 +951,23 @@ def _choose_probe_batch(shape_env: ShapeEnv) -> int | None:
     if traced_batch is None or shape_env.dynamic_batch is None:
         return None
     low, high = shape_env.dynamic_batch
-    if traced_batch == 1 and low <= 2 <= high:
-        return 2
-    if traced_batch != 1:
+    if shape_env.trace_batch_mode == "batch_1":
+        if traced_batch == 1 and low <= 2 <= high:
+            return 2
+        if low <= high and low != traced_batch:
+            return low
+        if high != traced_batch:
+            return high
+        return None
+    if shape_env.trace_batch_mode == "batch_gt1":
         next_batch = traced_batch + 1
         if low <= next_batch <= high:
             return next_batch
-        if low <= 2 <= high and traced_batch != 2:
-            return 2
-        if low <= 1 <= high:
-            return 1
+        if low <= high and low != traced_batch and low > 1:
+            return low
+        if high != traced_batch and high > 1:
+            return high
+        return None
     if low <= high and low != traced_batch:
         return low
     if high != traced_batch:

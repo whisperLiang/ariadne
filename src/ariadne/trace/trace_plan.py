@@ -82,6 +82,7 @@ def compute_graph_signature(nodes: tuple[TraceNode, ...], shape_env: ShapeEnv) -
     digest = sha256()
     digest.update(shape_env.batch_symbol.encode())
     digest.update(repr(shape_env.dynamic_batch).encode())
+    digest.update(shape_env.trace_batch_mode.encode())
     for node in nodes:
         if node.is_output:
             continue

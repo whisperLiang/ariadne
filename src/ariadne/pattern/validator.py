@@ -13,6 +13,10 @@ def validate_split_spec(spec: SplitSpec) -> None:
         low, high = spec.dynamic_batch
         if low < 1 or high < low:
             raise ValueError("SplitSpec.dynamic_batch must be a positive inclusive range.")
+        if spec.trace_batch_mode == "batch_1" and not low <= 1 <= high:
+            raise ValueError("batch_1 mode requires dynamic_batch to include batch size 1.")
+        if spec.trace_batch_mode == "batch_gt1" and low < 2:
+            raise ValueError("batch_gt1 mode requires dynamic_batch to start at 2 or greater.")
 
 
 def validate_schema_labels(schema: dict[str, BoundaryTensorSpec], labels: tuple[str, ...]) -> None:

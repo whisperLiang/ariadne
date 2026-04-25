@@ -57,10 +57,15 @@ def test_dynamic_batch_reuses_trace_for_multiple_batch_sizes() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(4, 3, 4),),
-        split=SplitSpec(boundary="after:act", dynamic_batch=(1, 16), trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 16),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
     )
 
-    for batch_size in (1, 2, 8, 16):
+    for batch_size in (2, 8, 16):
         inputs = (torch.randn(batch_size, 3, 4),)
         assert_forward_equivalent(model, runtime, inputs)
 
@@ -90,7 +95,12 @@ def test_batch_one_trace_replays_with_static_singleton_dimensions() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(1, 3, 4),),
-        split=SplitSpec(boundary="after:act", dynamic_batch=(1, 4), trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(1, 4),
+            trainable=True,
+            trace_batch_mode="batch_1",
+        ),
     )
 
     for batch_size in (1, 2, 4):
@@ -105,7 +115,12 @@ def test_batch_one_trace_supports_split_training_with_larger_batch() -> None:
     runtime = prepare_split(
         split_model,
         example_inputs=(torch.randn(1, 3, 4, requires_grad=True),),
-        split=SplitSpec(boundary="after:act", dynamic_batch=(1, 4), trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(1, 4),
+            trainable=True,
+            trace_batch_mode="batch_1",
+        ),
     )
 
     x_direct = torch.randn(4, 3, 4, requires_grad=True)
@@ -127,10 +142,43 @@ def test_batch_one_trace_uses_prepared_structural_variant_for_larger_batch() -> 
     runtime = prepare_split(
         model,
         example_inputs=(torch.randn(1, 3, 4),),
-        split=SplitSpec(boundary="after:act", dynamic_batch=(1, 4), trainable=True),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(1, 4),
+            trainable=True,
+            trace_batch_mode="batch_1",
+        ),
     )
 
     assert len(runtime.variants) == 1
     for batch_size in (1, 2, 4):
         inputs = (torch.randn(batch_size, 3, 4),)
         assert_forward_equivalent(model, runtime, inputs)
+
+
+def test_batch_gt1_trace_supports_cross_batch_training() -> None:
+    torch.manual_seed(0)
+    direct_model = ReshapeNet()
+    split_model = copy.deepcopy(direct_model)
+    runtime = prepare_split(
+        split_model,
+        example_inputs=(torch.randn(2, 3, 4, requires_grad=True),),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 5),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+
+    x_direct = torch.randn(5, 3, 4, requires_grad=True)
+    x_split = x_direct.detach().clone().requires_grad_(True)
+    targets = torch.randn(5, 2)
+    assert_gradient_equivalent(
+        direct_model,
+        runtime,
+        (x_direct,),
+        (x_split,),
+        targets,
+        loss_fn=F.mse_loss,
+    )

@@ -24,7 +24,12 @@ def main() -> None:
     runtime = prepare_split(
         model,
         example_inputs=(example,),
-        split=SplitSpec(boundary="after:layer2", dynamic_batch=(1, 64), trainable=True),
+        split=SplitSpec(
+            boundary="after:layer2",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
         mode="generated_eager",
     )
 

@@ -74,8 +74,9 @@ from ariadne import SplitSpec, prepare_split
 spec = SplitSpec(
     boundary="after:layer3",
     batch_symbol="B",
-    dynamic_batch=(1, 64),
+    dynamic_batch=(2, 64),
     trainable=True,
+    trace_batch_mode="batch_gt1",
 )
 
 runtime = prepare_split(
@@ -114,13 +115,19 @@ By default, Ariadne treats the first dimension of the first tensor input as the
 symbolic batch dimension `B`. If an example trace uses batch size 4, tensors like
 `(4, 256, 14, 14)` are recorded as `("B", 256, 14, 14)`.
 
-When tracing from batch size 1, Ariadne performs prepare-time batch provenance
-probes inside `SplitSpec.dynamic_batch`. This avoids treating every literal `1`
-as batch, and it can recover affine batch-derived shapes such as `4*B` that
-appear in windowed attention and token reshapes. If PyTorch chooses a different
-aten decomposition for batch 1 than for larger batches, Ariadne prepares a
-structural batch variant during preparation and dispatches to that generated
-segment at runtime without re-tracing.
+`SplitSpec.trace_batch_mode` makes the preparation strategy explicit:
+
+- `batch_1`: requires `example_inputs` batch size 1 and a `dynamic_batch` range
+  that includes 1. Ariadne performs prepare-time provenance probing and can
+  prepare a batch>1 structural variant when singleton and non-singleton aten
+  paths differ.
+- `batch_gt1`: requires `example_inputs` batch size greater than 1 and a
+  `dynamic_batch` range that starts at 2 or greater. Ariadne stays in the
+  non-singleton regime, derives affine batch shapes such as `4*B`, and avoids
+  the extra singleton structural variant used by `batch_1`.
+
+For real YOLO and RF-DETR smoke tests, Ariadne uses `batch_gt1` mode and verifies
+cross-batch split replay plus split training on batch sizes 2 and 3.
 
 At runtime, Ariadne materializes `B` from the actual input batch size, validates
 that it is inside `SplitSpec.dynamic_batch`, and checks that non-batch dimensions
