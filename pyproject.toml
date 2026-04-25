@@ -13,6 +13,12 @@ dependencies = [
     "typing-extensions>=4.15.0",
 ]
 
+[project.optional-dependencies]
+integration = [
+    "rfdetr>=1.6.5",
+    "ultralytics>=8.4.41",
+]
+
 [project.scripts]
 ariadne = "ariadne:main"
 
@@ -42,3 +48,8 @@ strict = true
 warn_unused_ignores = false
 ignore_missing_imports = true
 disable_error_code = ["no-untyped-call"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires optional real-model dependencies and may download model weights",
+]

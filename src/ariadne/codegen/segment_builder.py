@@ -8,7 +8,13 @@ from typing import Any, cast
 import torch
 from torch.fx import Graph, GraphModule, Node
 
+from ariadne.codegen.interception_segments import (
+    build_interception_prefix,
+    build_interception_suffix,
+)
 from ariadne.planner.frontier import SplitCandidate
+from ariadne.trace.interception import InterceptionTraceArtifact
+from ariadne.trace.trace_plan import TracePlan
 
 
 @dataclass(frozen=True)
@@ -19,8 +25,28 @@ class SegmentBundle:
     passthrough_order: tuple[str, ...]
 
 
-def build_segments(graph_module: GraphModule, candidate: SplitCandidate) -> SegmentBundle:
+def build_segments(plan: TracePlan, candidate: SplitCandidate) -> SegmentBundle:
     """Build generated eager prefix/suffix callables as FX GraphModules."""
+    if isinstance(plan.runtime_artifact, InterceptionTraceArtifact):
+        return SegmentBundle(
+            prefix=build_interception_prefix(
+                root=plan.fx_graph_module,
+                artifact=plan.runtime_artifact,
+                op_names=candidate.prefix_nodes,
+                raw_input_names=plan.input_node_names,
+                boundary_order=candidate.boundary_nodes,
+            ),
+            suffix=build_interception_suffix(
+                root=plan.fx_graph_module,
+                artifact=plan.runtime_artifact,
+                op_names=candidate.suffix_nodes,
+                boundary_order=candidate.boundary_nodes,
+                passthrough_order=candidate.passthrough_inputs,
+            ),
+            boundary_order=candidate.boundary_nodes,
+            passthrough_order=candidate.passthrough_inputs,
+        )
+    graph_module = cast(GraphModule, plan.fx_graph_module)
     return SegmentBundle(
         prefix=_build_prefix(graph_module, candidate),
         suffix=_build_suffix(graph_module, candidate),

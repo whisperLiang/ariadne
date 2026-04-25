@@ -47,7 +47,7 @@ def prepare_split(
         dynamic_batch=spec.dynamic_batch,
     )
     candidate = select_split(plan, split=spec if split != "auto" else "auto", objective=objective)
-    segments = build_segments(plan.fx_graph_module, candidate)
+    segments = build_segments(plan, candidate)
     segments = maybe_compile_segments(segments, mode=mode, compile_options=compile_options)
 
     return SplitRuntime(

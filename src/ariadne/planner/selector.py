@@ -33,9 +33,10 @@ def select_split(
     if not matches:
         labels = ", ".join(f"after:{candidate.boundary_after}" for candidate in candidates)
         raise ValueError(f"No split matches {split.boundary!r}. Available split labels: {labels}.")
-    if split.trainable and not matches[0].trainable_suffix:
+    selected = matches[-1]
+    if split.trainable and not selected.trainable_suffix:
         raise ValueError(f"Split {split.boundary!r} does not have trainable suffix parameters.")
-    return matches[0]
+    return selected
 
 
 def _select_auto(

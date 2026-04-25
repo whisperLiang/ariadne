@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
-from torch.fx import GraphModule
+import torch
 
 from ariadne.trace.tensor_meta import BufferRef, ParamRef, ShapeEnv, TensorMeta
 
@@ -57,7 +57,8 @@ class TracePlan:
     shape_env: ShapeEnv
     input_node_names: tuple[str, ...]
     output_template: Any
-    fx_graph_module: GraphModule
+    fx_graph_module: torch.nn.Module
+    runtime_artifact: Any | None = None
 
     @property
     def node_names(self) -> tuple[str, ...]:

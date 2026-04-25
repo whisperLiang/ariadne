@@ -56,6 +56,14 @@ uv run python examples/split_inference_demo.py
 uv run python examples/split_training_demo.py
 ```
 
+Optional real-model smoke checks install the `integration` extra and may download
+YOLO weights:
+
+```bash
+uv run --extra integration python examples/real_model_functional_test.py
+ARIADNE_RUN_REAL_MODELS=1 uv run --extra integration pytest tests/integration -m integration
+```
+
 ## Basic Split Inference
 
 ```python
@@ -112,8 +120,8 @@ part of `RuntimeCacheKey`.
 
 ## Execution Modes
 
-- `debug_interpreter`: slow FX interpreter execution for validation and debugging.
-- `generated_eager`: default generated prefix/suffix `GraphModule` execution.
+- `debug_interpreter`: slow interpreter execution for validation and debugging.
+- `generated_eager`: default generated prefix/suffix segment execution.
 - `compiled`: applies `torch.compile` to generated segments after preparation.
 
 Example:
@@ -137,8 +145,9 @@ batch size, split id, execution mode, and optional CUDA peak memory.
 
 ## Current Limitations
 
-- The initial tracer is FX-backed and targets common module/function/method graphs.
-- Python control flow that FX cannot trace may need a future runtime-interception backend.
+- The default tracer uses `TorchDispatchMode` runtime interception and records the
+  observed forward path.
 - Alias, mutation, RNG, FLOP, and memory metadata are intentionally lightweight.
 - Segment generation currently supports tensor boundaries from one observed path.
 - Dynamic non-batch dimensions are reserved for future SplitSpec extensions.
+- Complex shape expressions beyond direct batch-size uses are still limited.

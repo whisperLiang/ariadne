@@ -18,6 +18,7 @@ from torch.fx import GraphModule, Node, symbolic_trace
 from torch.fx.passes.shape_prop import ShapeProp
 from torch.fx.passes.shape_prop import TensorMetadata as FxTensorMetadata
 
+from ariadne.trace.interception import trace_model_interception
 from ariadne.trace.tensor_meta import (
     BufferRef,
     ParamRef,
@@ -48,6 +49,22 @@ _RNG_FUNCTION_NAMES = {"rand", "randn", "randint", "normal", "bernoulli", "dropo
 
 
 def trace_model(
+    model: torch.nn.Module,
+    *,
+    example_inputs: Sequence[Any],
+    batch_symbol: str = "B",
+    dynamic_batch: tuple[int, int] | None = None,
+) -> TracePlan:
+    """Trace a model with runtime interception."""
+    return trace_model_interception(
+        model,
+        example_inputs=tuple(example_inputs),
+        batch_symbol=batch_symbol,
+        dynamic_batch=dynamic_batch,
+    )
+
+
+def trace_model_fx(
     model: torch.nn.Module,
     *,
     example_inputs: Sequence[Any],
@@ -85,6 +102,7 @@ def trace_model(
         input_node_names=tuple(node.name for node in nodes if node.op == "placeholder"),
         output_template=_output_template(graph_module),
         fx_graph_module=graph_module,
+        runtime_artifact=None,
     )
     return plan
 

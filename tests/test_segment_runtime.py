@@ -53,9 +53,10 @@ def test_boundary_validation_rejects_missing_label_and_wrong_static_dim() -> Non
         split=SplitSpec(boundary="after:act", trainable=True),
     )
     boundary = runtime.run_prefix(torch.randn(4, 5))
+    label = next(iter(boundary.tensors))
 
     missing = dict(boundary.tensors)
-    missing.pop("act")
+    missing.pop(label)
     bad_missing = boundary.__class__(
         split_id=boundary.split_id,
         graph_signature=boundary.graph_signature,
@@ -69,7 +70,7 @@ def test_boundary_validation_rejects_missing_label_and_wrong_static_dim() -> Non
         runtime.run_suffix(bad_missing)
 
     bad_tensors = dict(boundary.tensors)
-    bad_tensors["act"] = torch.randn(4, 9)
+    bad_tensors[label] = torch.randn(4, 9)
     bad_shape = boundary.__class__(
         split_id=boundary.split_id,
         graph_signature=boundary.graph_signature,

@@ -25,9 +25,9 @@ def test_frontier_planner_selects_named_module_boundary() -> None:
 
     candidate = select_split(plan, split=SplitSpec(boundary="after:act", trainable=True))
 
-    assert candidate.boundary_nodes == ("act",)
+    assert len(candidate.boundary_nodes) == 1
     assert candidate.trainable_suffix
-    assert candidate.boundary_schema["act"].symbolic_shape == ("B", 8)
+    assert candidate.boundary_schema[candidate.boundary_nodes[0]].symbolic_shape == ("B", 8)
 
 
 def test_auto_split_returns_lowest_boundary_candidate() -> None:
