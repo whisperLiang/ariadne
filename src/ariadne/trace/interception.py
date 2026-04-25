@@ -312,7 +312,7 @@ def trace_model_interception(
         shape_env=shape_env,
         input_node_names=recorder.input_node_names,
         output_template=output_template,
-        fx_graph_module=model,
+        root_module=model,
         runtime_artifact=artifact,
     )
 

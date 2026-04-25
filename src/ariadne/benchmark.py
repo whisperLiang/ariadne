@@ -134,12 +134,12 @@ def _benchmark_training_paths(
     grad_inputs = _clone_inputs_for_grad(inputs)
 
     def suffix_train() -> None:
-        runtime.trace_plan.fx_graph_module.zero_grad(set_to_none=True)
+        runtime.trace_plan.root_module.zero_grad(set_to_none=True)
         boundary = runtime.run_prefix(*grad_inputs)
         runtime.train_suffix(boundary, targets, loss_fn=loss_fn)
 
     def prefix_backward() -> None:
-        runtime.trace_plan.fx_graph_module.zero_grad(set_to_none=True)
+        runtime.trace_plan.root_module.zero_grad(set_to_none=True)
         boundary = runtime.run_prefix(*grad_inputs)
         _, boundary_grads = runtime.train_suffix(boundary, targets, loss_fn=loss_fn)
         runtime.backward_prefix(*grad_inputs, boundary_grads=boundary_grads)

@@ -19,7 +19,7 @@ def assert_gradient_equivalent(
     atol: float = 1e-6,
     rtol: float = 1e-5,
 ) -> None:
-    for model in (direct_model, split_runtime.trace_plan.fx_graph_module):
+    for model in (direct_model, split_runtime.trace_plan.root_module):
         model.zero_grad(set_to_none=True)
     direct_loss = loss_fn(direct_model(*direct_inputs), targets)
     direct_loss.backward()
@@ -29,7 +29,7 @@ def assert_gradient_equivalent(
     split_runtime.backward_prefix(*split_inputs, boundary_grads=boundary_grads)
 
     direct_params = dict(direct_model.named_parameters())
-    split_params = dict(split_runtime.trace_plan.fx_graph_module.named_parameters())
+    split_params = dict(split_runtime.trace_plan.root_module.named_parameters())
     for name, direct_param in direct_params.items():
         split_param = split_params[name]
         if direct_param.grad is None or split_param.grad is None:

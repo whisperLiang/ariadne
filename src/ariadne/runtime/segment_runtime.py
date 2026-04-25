@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import torch
-from torch.fx import GraphModule, Interpreter
 
+from ariadne.codegen.interception_segments import as_debug_interpreter
 from ariadne.codegen.segment_builder import SegmentBundle
 from ariadne.pattern.split_spec import SplitSpec
 from ariadne.planner.frontier import SplitCandidate
@@ -17,17 +17,6 @@ from ariadne.runtime.train_runtime import backward_prefix, train_suffix
 from ariadne.trace.trace_plan import TracePlan
 
 BoundaryGradients = dict[str, torch.Tensor | None]
-
-
-class DebugInterpreterModule(torch.nn.Module):
-    """Node-by-node interpreter wrapper used only for debug_interpreter mode."""
-
-    def __init__(self, graph_module: GraphModule) -> None:
-        super().__init__()
-        self.graph_module = graph_module
-
-    def forward(self, *args: Any) -> Any:
-        return Interpreter(self.graph_module).run(*args)
 
 
 @dataclass
@@ -42,12 +31,8 @@ class SplitRuntime:
 
     def __post_init__(self) -> None:
         if self.mode == "debug_interpreter":
-            self.prefix_segment: torch.nn.Module = DebugInterpreterModule(
-                cast(GraphModule, self.segments.prefix)
-            )
-            self.suffix_segment: torch.nn.Module = DebugInterpreterModule(
-                cast(GraphModule, self.segments.suffix)
-            )
+            self.prefix_segment: torch.nn.Module = as_debug_interpreter(self.segments.prefix)
+            self.suffix_segment: torch.nn.Module = as_debug_interpreter(self.segments.suffix)
         else:
             self.prefix_segment = self.segments.prefix
             self.suffix_segment = self.segments.suffix

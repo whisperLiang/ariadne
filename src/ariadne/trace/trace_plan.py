@@ -57,7 +57,7 @@ class TracePlan:
     shape_env: ShapeEnv
     input_node_names: tuple[str, ...]
     output_template: Any
-    fx_graph_module: torch.nn.Module
+    root_module: torch.nn.Module
     runtime_artifact: Any | None = None
 
     @property

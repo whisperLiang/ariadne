@@ -84,6 +84,26 @@ class GeneratedInterceptionSegment(torch.nn.Module):
         return materialize_template(self.output_template, env)
 
 
+class InterpretedInterceptionSegment(torch.nn.Module):
+    """Node-by-node execution over captured ops for debug mode only."""
+
+    def __init__(self, generated: GeneratedInterceptionSegment) -> None:
+        super().__init__()
+        self.generated = generated
+
+    def forward(self, *inputs: Any) -> Any:
+        env = self.generated._new_env(inputs)
+        for index in range(len(self.generated.ops)):
+            self.generated._run_op(index, env)
+        return self.generated._materialize_output(env)
+
+
+def as_debug_interpreter(segment: torch.nn.Module) -> torch.nn.Module:
+    if not isinstance(segment, GeneratedInterceptionSegment):
+        raise TypeError("debug_interpreter requires a generated interception segment.")
+    return InterpretedInterceptionSegment(segment)
+
+
 def build_interception_prefix(
     *,
     root: torch.nn.Module,

@@ -61,6 +61,7 @@ YOLO weights:
 
 ```bash
 uv run --extra integration python examples/real_model_functional_test.py
+uv run --extra integration python examples/real_model_timing.py --iterations 3 --warmup 1
 ARIADNE_RUN_REAL_MODELS=1 uv run --extra integration pytest tests/integration -m integration
 ```
 

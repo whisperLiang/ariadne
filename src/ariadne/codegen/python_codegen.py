@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from torch.fx import GraphModule
+import torch
 
 
-def segment_source(segment: GraphModule) -> str:
+def segment_source(segment: torch.nn.Module) -> str:
     """Return readable generated Python for a segment."""
-    return str(segment.code)
+    return str(getattr(segment, "generated_source", segment))

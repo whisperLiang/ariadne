@@ -14,10 +14,11 @@ class BranchFunctionalNet(nn.Module):
         self.out = nn.Linear(4, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
         if bool(x.sum().item() > 0):  # noqa: SIM108 - keeps the branch explicit for tracing.
+            x = self.proj(x)
             x = torch.sin(x) + torch.cos(x)
         else:
+            x = self.proj(x)
             x = torch.relu(x)
         return self.out(x)
 
