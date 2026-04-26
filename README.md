@@ -57,7 +57,9 @@ uv run python examples/split_training_demo.py
 ```
 
 Optional real-model smoke checks install the `integration` extra and may download
-YOLO weights:
+YOLO weights. The current integration suite covers `YOLOv8n`, `RF-DETR Nano`,
+`timm resnet50`, `timm swin_tiny_patch4_window7_224`, `torchvision mobilenet_v3_large`,
+and `torchvision deeplabv3_resnet50`:
 
 ```bash
 uv run --extra integration python examples/real_model_functional_test.py

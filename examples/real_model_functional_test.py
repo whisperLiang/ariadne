@@ -80,6 +80,36 @@ def assert_split_train_equivalent(
     model.zero_grad(set_to_none=True)
 
 
+def run_model_smoke(
+    *,
+    name: str,
+    model: nn.Module,
+    input_shape: tuple[int, ...],
+    boundary: str,
+    replay_batches: tuple[int, int] = (2, 3),
+) -> None:
+    low, high = replay_batches
+    x = torch.randn(low, *input_shape)
+    runtime = prepare_split(
+        model,
+        example_inputs=(x,),
+        split=SplitSpec(
+            boundary=boundary,
+            dynamic_batch=replay_batches,
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+    for batch_size in replay_batches:
+        x_batch = torch.randn(batch_size, *input_shape)
+        with torch.no_grad():
+            split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
+            direct_output = model(x_batch)
+        assert_nested_close(split_output, direct_output)
+    assert_split_train_equivalent(model, runtime, torch.randn(high, *input_shape))
+    print(f"{name} batch_gt1 ok: split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}")
+
+
 def run_yolo_smoke() -> None:
     from ultralytics import YOLO
 
@@ -88,27 +118,55 @@ def run_yolo_smoke() -> None:
     with _pushd(weights_dir):
         yolo = YOLO("yolov8n.pt")
     model = yolo.model.eval()
-    x = torch.randn(2, 3, 64, 64)
-    runtime = prepare_split(
-        model,
-        example_inputs=(x,),
-        split=SplitSpec(
-            boundary="after:model.2",
-            dynamic_batch=(2, 3),
-            trainable=True,
-            trace_batch_mode="batch_gt1",
-        ),
+    run_model_smoke(
+        name="YOLO",
+        model=model,
+        input_shape=(3, 64, 64),
+        boundary="after:model.2",
     )
-    for batch_size in (2, 3):
-        x_batch = torch.randn(batch_size, 3, 64, 64)
-        with torch.no_grad():
-            split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
-            direct_output = model(x_batch)
-        assert_nested_close(split_output, direct_output)
-    assert_split_train_equivalent(model, runtime, torch.randn(3, 3, 64, 64))
-    print(
-        "YOLO batch_gt1 ok: "
-        f"split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}"
+
+
+def run_timm_resnet50_smoke() -> None:
+    import timm
+
+    run_model_smoke(
+        name="timm resnet50",
+        model=timm.create_model("resnet50", pretrained=False).eval(),
+        input_shape=(3, 96, 96),
+        boundary="after:layer3",
+    )
+
+
+def run_torchvision_mobilenet_v3_large_smoke() -> None:
+    from torchvision.models import mobilenet_v3_large
+
+    run_model_smoke(
+        name="torchvision mobilenet_v3_large",
+        model=mobilenet_v3_large(weights=None).eval(),
+        input_shape=(3, 96, 96),
+        boundary="after:features.10",
+    )
+
+
+def run_timm_swin_tiny_smoke() -> None:
+    import timm
+
+    run_model_smoke(
+        name="timm swin_tiny",
+        model=timm.create_model("swin_tiny_patch4_window7_224", pretrained=False).eval(),
+        input_shape=(3, 224, 224),
+        boundary="after:layers.1",
+    )
+
+
+def run_deeplabv3_smoke() -> None:
+    from torchvision.models.segmentation import deeplabv3_resnet50
+
+    run_model_smoke(
+        name="torchvision deeplabv3_resnet50",
+        model=deeplabv3_resnet50(weights=None, weights_backbone=None).eval(),
+        input_shape=(3, 96, 96),
+        boundary="after:backbone.layer3",
     )
 
 
@@ -130,28 +188,11 @@ class RFDETRTensorWrapper(nn.Module):
 
 
 def run_rfdetr_smoke() -> None:
-    model = RFDETRTensorWrapper().eval()
-    x = torch.randn(2, 3, 128, 128)
-    runtime = prepare_split(
-        model,
-        example_inputs=(x,),
-        split=SplitSpec(
-            boundary="after:model.transformer.decoder.layers.0.norm3",
-            dynamic_batch=(2, 3),
-            trainable=True,
-            trace_batch_mode="batch_gt1",
-        ),
-    )
-    for batch_size in (2, 3):
-        x_batch = torch.randn(batch_size, 3, 128, 128)
-        with torch.no_grad():
-            split_output = runtime.run_suffix(runtime.run_prefix(x_batch))
-            direct_output = model(x_batch)
-        assert_nested_close(split_output, direct_output)
-    assert_split_train_equivalent(model, runtime, torch.randn(3, 3, 128, 128))
-    print(
-        "RF-DETR batch_gt1 ok: "
-        f"split_id={runtime.split_id} nodes={len(runtime.trace_plan.nodes)}"
+    run_model_smoke(
+        name="RF-DETR",
+        model=RFDETRTensorWrapper().eval(),
+        input_shape=(3, 128, 128),
+        boundary="after:model.transformer.decoder.layers.0.norm3",
     )
 
 
@@ -168,6 +209,10 @@ def _pushd(path: Path) -> Any:
 def main() -> None:
     torch.manual_seed(0)
     run_yolo_smoke()
+    run_timm_resnet50_smoke()
+    run_torchvision_mobilenet_v3_large_smoke()
+    run_timm_swin_tiny_smoke()
+    run_deeplabv3_smoke()
     run_rfdetr_smoke()
 
 
