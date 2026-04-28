@@ -31,7 +31,36 @@ generates executable segments so runtime work stays simple:
 - Keep node-by-node interpretation only for `debug_interpreter` validation.
 - Use `torch.compile` only as an optional optimizer for generated segments.
 
-## Installation With uv
+## Installation
+
+### Quick Start (Users)
+
+Install Ariadne from PyPI:
+
+```bash
+pip install ariadne-split
+```
+
+After installation, you can import and use Ariadne:
+
+```python
+from ariadne import SplitSpec, prepare_split
+import torch
+
+# See usage examples in "Basic Split Inference" and "Basic Split Training" sections below
+```
+
+### Optional Dependencies
+
+For real-model integration tests (YOLOv8n, RF-DETR, timm models, torchvision), install with the `integration` extra:
+
+```bash
+pip install ariadne-split[integration]
+```
+
+### Development Setup (Contributors)
+
+If you're developing Ariadne or want to run the full test suite:
 
 ```bash
 uv sync
@@ -40,7 +69,7 @@ uv sync
 Dependencies are declared only in `pyproject.toml`, and `uv.lock` is committed
 for reproducible installs.
 
-## Development
+## Development & Testing
 
 ```bash
 uv sync
