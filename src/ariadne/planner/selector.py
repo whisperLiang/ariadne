@@ -20,8 +20,18 @@ def select_split(
     if not candidates:
         raise ValueError("No valid frontier split candidates were found.")
 
-    if split == "auto" or (isinstance(split, SplitSpec) and split.boundary == "auto"):
-        return _select_auto(candidates, objective)
+    if split == "auto":
+        return _select_auto(
+            candidates,
+            objective,
+            require_trainable_suffix=False,
+        )
+    if isinstance(split, SplitSpec) and split.boundary == "auto":
+        return _select_auto(
+            candidates,
+            objective,
+            require_trainable_suffix=split.trainable,
+        )
 
     if not isinstance(split, SplitSpec):
         raise TypeError("split must be a SplitSpec or 'auto'.")
@@ -42,10 +52,12 @@ def select_split(
 def _select_auto(
     candidates: list[SplitCandidate],
     objective: Mapping[str, Any] | None,
+    *,
+    require_trainable_suffix: bool,
 ) -> SplitCandidate:
     filtered = candidates
     constraints = dict(objective.get("constraints", {})) if objective is not None else {}
-    if constraints.get("trainable_suffix"):
+    if constraints.get("trainable_suffix") or require_trainable_suffix:
         filtered = [candidate for candidate in filtered if candidate.trainable_suffix]
     if not filtered:
         raise ValueError("No split candidates satisfy the requested objective constraints.")

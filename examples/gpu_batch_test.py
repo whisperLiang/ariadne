@@ -14,12 +14,13 @@ Supported models:
 - RF-DETR Nano (rfdetr)
 """
 
-import sys
+import argparse
 import contextlib
 import os
-import argparse
+import sys
 from pathlib import Path
 from time import perf_counter
+
 import torch
 import torch.nn as nn
 
@@ -57,16 +58,16 @@ def benchmark(fn, iterations=10, warmup=3):
 
 def nested_tensor_loss(value):
     """Compute loss for nested tensor structures"""
+    if isinstance(value, torch.Tensor) and (value.is_floating_point() or value.is_complex()):
+        return value.float().square().mean()
     if isinstance(value, torch.Tensor):
-        if value.is_floating_point() or value.is_complex():
-            return value.float().square().mean()
         return torch.tensor(0.0, device=value.device)
     if isinstance(value, (tuple, list)):
         losses = [nested_tensor_loss(item) for item in value]
-        return sum(l for l in losses if l.numel() > 0)
+        return sum(loss for loss in losses if loss.numel() > 0)
     if isinstance(value, dict):
         losses = [nested_tensor_loss(item) for item in value.values()]
-        return sum(l for l in losses if l.numel() > 0)
+        return sum(loss for loss in losses if loss.numel() > 0)
     return torch.tensor(0.0)
 
 
@@ -81,9 +82,11 @@ def _pushd(path: Path):
         os.chdir(previous)
 
 
-def test_model(name, model, input_shape, trace_batch=2, test_batches=[4, 32, 256], 
-               iterations=10, warmup=3):
+def run_model(name, model, input_shape, trace_batch=2, test_batches=None, iterations=10, warmup=3):
     """Test a single model with automatic split selection"""
+    if test_batches is None:
+        test_batches = [4, 32, 256]
+
     print("=" * 80)
     print(f"Testing Model: {name}")
     print("=" * 80)
@@ -108,7 +111,7 @@ def test_model(name, model, input_shape, trace_batch=2, test_batches=[4, 32, 256
         ),
         objective={
             "minimize": "boundary_bytes",
-            "constraints": {"trainable_suffix": True}
+            "constraints": {"trainable_suffix": True},
         },
     )
     sync_cuda()
@@ -133,39 +136,47 @@ def test_model(name, model, input_shape, trace_batch=2, test_batches=[4, 32, 256
         
         # Inference
         with torch.no_grad():
-            avg, std = benchmark(lambda: model(test_input), iterations, warmup)
+            avg, std = benchmark(
+                lambda test_input=test_input: model(test_input),
+                iterations,
+                warmup,
+            )
             print(f"  direct_forward:      {avg:>8.3f} ± {std:>6.3f} ms")
-            results[batch_size] = {'direct': avg}
+            results[batch_size] = {"direct": avg}
             
-            avg, std = benchmark(lambda: runtime.run_suffix(runtime.run_prefix(test_input)), 
-                               iterations, warmup)
+            avg, std = benchmark(
+                lambda test_input=test_input: runtime.run_suffix(runtime.run_prefix(test_input)),
+                iterations,
+                warmup,
+            )
             print(f"  prefix+suffix:       {avg:>8.3f} ± {std:>6.3f} ms")
-            results[batch_size]['split'] = avg
+            results[batch_size]["split"] = avg
         
         # Training
-        def direct_train():
+        def direct_train(test_input=test_input):
             model.zero_grad(set_to_none=True)
             inputs = test_input.detach().clone().requires_grad_(True)
             loss = nested_tensor_loss(model(inputs))
             loss.backward()
         
-        def split_train():
+        def split_train(test_input=test_input):
             runtime.trace_plan.root_module.zero_grad(set_to_none=True)
             inputs = test_input.detach().clone().requires_grad_(True)
-            boundary = runtime.run_prefix(inputs)
+            boundary = runtime.run_training_prefix(inputs)
             loss, boundary_grads = runtime.train_suffix(
-                boundary, None,
-                loss_fn=lambda outputs, _: nested_tensor_loss(outputs)
+                boundary,
+                None,
+                loss_fn=lambda outputs, _: nested_tensor_loss(outputs),
             )
-            runtime.backward_prefix(inputs, boundary_grads=boundary_grads)
+            runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
         
         avg, std = benchmark(direct_train, iterations, warmup)
         print(f"  direct_train:        {avg:>8.3f} ± {std:>6.3f} ms")
-        results[batch_size]['direct_train'] = avg
+        results[batch_size]["direct_train"] = avg
         
         avg, std = benchmark(split_train, iterations, warmup)
         print(f"  split_train:         {avg:>8.3f} ± {std:>6.3f} ms")
-        results[batch_size]['split_train'] = avg
+        results[batch_size]["split_train"] = avg
         
         print()
     
@@ -174,43 +185,58 @@ def test_model(name, model, input_shape, trace_batch=2, test_batches=[4, 32, 256
     print("-" * 80)
     print("Inference Overhead (prefix+suffix vs direct_forward):")
     for batch_size in test_batches:
-        overhead = (results[batch_size]['split'] / results[batch_size]['direct'] - 1) * 100
+        overhead = (results[batch_size]["split"] / results[batch_size]["direct"] - 1) * 100
         print(f"  Batch {batch_size:>3}: {overhead:>6.2f}%")
     
     print("\nTraining Overhead (split_train vs direct_train):")
     for batch_size in test_batches:
-        overhead = (results[batch_size]['split_train'] / results[batch_size]['direct_train'] - 1) * 100
+        overhead = (
+            results[batch_size]["split_train"] / results[batch_size]["direct_train"] - 1
+        ) * 100
         print(f"  Batch {batch_size:>3}: {overhead:>6.2f}%")
     print()
     
     return results
 
 
-def test_resnet50(trace_batch, test_batches, iterations, warmup):
+def run_resnet50(trace_batch, test_batches, iterations, warmup):
     """Test ResNet50 with automatic split selection"""
     import timm
     model = timm.create_model("resnet50", pretrained=False)
-    return test_model("ResNet50", model, (3, 96, 96),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model("ResNet50", model, (3, 96, 96), trace_batch, test_batches, iterations, warmup)
 
 
-def test_mobilenet(trace_batch, test_batches, iterations, warmup):
+def run_mobilenet(trace_batch, test_batches, iterations, warmup):
     """Test MobileNetV3 with automatic split selection"""
     from torchvision.models import mobilenet_v3_large
     model = mobilenet_v3_large(weights=None)
-    return test_model("MobileNetV3", model, (3, 96, 96),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model(
+        "MobileNetV3",
+        model,
+        (3, 96, 96),
+        trace_batch,
+        test_batches,
+        iterations,
+        warmup,
+    )
 
 
-def test_efficientnet(trace_batch, test_batches, iterations, warmup):
+def run_efficientnet(trace_batch, test_batches, iterations, warmup):
     """Test EfficientNet with automatic split selection"""
     import timm
     model = timm.create_model("efficientnet_b0", pretrained=False)
-    return test_model("EfficientNet-B0", model, (3, 96, 96),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model(
+        "EfficientNet-B0",
+        model,
+        (3, 96, 96),
+        trace_batch,
+        test_batches,
+        iterations,
+        warmup,
+    )
 
 
-def test_yolo(trace_batch, test_batches, iterations, warmup):
+def run_yolo(trace_batch, test_batches, iterations, warmup):
     """Test YOLOv8n with automatic split selection"""
     from ultralytics import YOLO
     weights_dir = Path(".ariadne_models")
@@ -218,27 +244,32 @@ def test_yolo(trace_batch, test_batches, iterations, warmup):
     with _pushd(weights_dir):
         yolo = YOLO("yolov8n.pt")
     model = yolo.model
-    return test_model("YOLOv8n", model, (3, 64, 64),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model("YOLOv8n", model, (3, 64, 64), trace_batch, test_batches, iterations, warmup)
 
 
-def test_swin(trace_batch, test_batches, iterations, warmup):
+def run_swin(trace_batch, test_batches, iterations, warmup):
     """Test Swin Transformer with automatic split selection"""
     import timm
     model = timm.create_model("swin_tiny_patch4_window7_224", pretrained=False)
-    return test_model("Swin-Tiny", model, (3, 224, 224),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model(
+        "Swin-Tiny",
+        model,
+        (3, 224, 224),
+        trace_batch,
+        test_batches,
+        iterations,
+        warmup,
+    )
 
 
-def test_deeplabv3(trace_batch, test_batches, iterations, warmup):
+def run_deeplabv3(trace_batch, test_batches, iterations, warmup):
     """Test DeepLabV3 with automatic split selection"""
     from torchvision.models.segmentation import deeplabv3_resnet50
     model = deeplabv3_resnet50(weights=None, weights_backbone=None)
-    return test_model("DeepLabV3", model, (3, 96, 96),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model("DeepLabV3", model, (3, 96, 96), trace_batch, test_batches, iterations, warmup)
 
 
-def test_rfdetr(trace_batch, test_batches, iterations, warmup):
+def run_rfdetr(trace_batch, test_batches, iterations, warmup):
     """Test RF-DETR with automatic split selection"""
     from rfdetr import RFDETRNano
     from rfdetr.utilities.tensors import NestedTensor
@@ -254,19 +285,29 @@ def test_rfdetr(trace_batch, test_batches, iterations, warmup):
             return self.model(NestedTensor(x, mask))
     
     model = RFDETRWrapper()
-    return test_model("RF-DETR", model, (3, 128, 128),
-                     trace_batch, test_batches, iterations, warmup)
+    return run_model("RF-DETR", model, (3, 128, 128), trace_batch, test_batches, iterations, warmup)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GPU Batch Performance Test - trace with batch=2, test different batch sizes with auto split selection"
+        description=(
+            "GPU Batch Performance Test - trace with batch=2, test different batch sizes "
+            "with auto split selection"
+        )
     )
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["resnet50", "mobilenet", "efficientnet", "yolo", "swin", 
-                "deeplabv3", "rfdetr", "all"],
+        choices=[
+            "resnet50",
+            "mobilenet",
+            "efficientnet",
+            "yolo",
+            "swin",
+            "deeplabv3",
+            "rfdetr",
+            "all",
+        ],
         default=["all"],
         help="Models to test (default: all)",
     )
@@ -312,27 +353,24 @@ def main():
     print(f"Test Batches: {args.batches}")
     print(f"Iterations: {args.iterations}")
     print(f"Warmup: {args.warmup}")
-    print(f"Split Selection: Automatic (minimize boundary_bytes, trainable_suffix required)")
+    print("Split Selection: Automatic (minimize boundary_bytes, trainable_suffix required)")
     print()
     
     torch.manual_seed(0)
     
     # Model mapping
     model_map = {
-        "resnet50": test_resnet50,
-        "mobilenet": test_mobilenet,
-        "efficientnet": test_efficientnet,
-        "yolo": test_yolo,
-        "swin": test_swin,
-        "deeplabv3": test_deeplabv3,
-        "rfdetr": test_rfdetr,
+        "resnet50": run_resnet50,
+        "mobilenet": run_mobilenet,
+        "efficientnet": run_efficientnet,
+        "yolo": run_yolo,
+        "swin": run_swin,
+        "deeplabv3": run_deeplabv3,
+        "rfdetr": run_rfdetr,
     }
     
     # Select models
-    if "all" in args.models:
-        models_to_test = list(model_map.keys())
-    else:
-        models_to_test = args.models
+    models_to_test = list(model_map.keys()) if "all" in args.models else args.models
     
     # Run tests
     all_results = {}
@@ -368,9 +406,18 @@ def main():
             
             for model_name, results in all_results.items():
                 if batch_size in results:
-                    inf_overhead = (results[batch_size]['split'] / results[batch_size]['direct'] - 1) * 100
-                    train_overhead = (results[batch_size]['split_train'] / results[batch_size]['direct_train'] - 1) * 100
-                    print(f"{model_name:<20} {inf_overhead:>6.2f}%        {train_overhead:>6.2f}%")
+                    inf_overhead = (
+                        results[batch_size]["split"] / results[batch_size]["direct"] - 1
+                    ) * 100
+                    train_overhead = (
+                        results[batch_size]["split_train"]
+                        / results[batch_size]["direct_train"]
+                        - 1
+                    ) * 100
+                    print(
+                        f"{model_name:<20} {inf_overhead:>6.2f}%        "
+                        f"{train_overhead:>6.2f}%"
+                    )
             print()
     
     print("=" * 80)

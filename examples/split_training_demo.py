@@ -40,14 +40,14 @@ def main() -> None:
         lr=0.01,
     )
 
-    boundary = runtime.run_prefix(x)
+    boundary = runtime.run_training_prefix(x)
     loss, boundary_grads = runtime.train_suffix(
         boundary,
         targets,
         loss_fn=F.mse_loss,
         optimizer=suffix_optimizer,
     )
-    runtime.backward_prefix(x, boundary_grads=boundary_grads, optimizer=prefix_optimizer)
+    runtime.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=prefix_optimizer)
     print(f"loss={float(loss):.6f} boundary_labels={list(boundary_grads)}")
 
 

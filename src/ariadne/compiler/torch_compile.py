@@ -21,6 +21,10 @@ def maybe_compile_segments(
     options = dict(compile_options or {})
     return SegmentBundle(
         prefix=cast(torch.nn.Module, torch.compile(segments.prefix, **options)),
+        training_prefix=cast(
+            torch.nn.Module,
+            torch.compile(segments.training_prefix, **options),
+        ),
         suffix=cast(torch.nn.Module, torch.compile(segments.suffix, **options)),
         boundary_order=segments.boundary_order,
         passthrough_order=segments.passthrough_order,

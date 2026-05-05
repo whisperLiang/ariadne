@@ -163,7 +163,9 @@ def _benchmark_spec(
     )
     prepare_total = perf_counter() - prepare_start
     boundary = runtime.run_prefix(benchmark_inputs)
-    train_boundary = runtime.run_prefix(benchmark_inputs.detach().clone().requires_grad_(True))
+    train_boundary = runtime.run_training_prefix(
+        benchmark_inputs.detach().clone().requires_grad_(True)
+    )
     _, boundary_grads = runtime.train_suffix(
         train_boundary,
         None,
@@ -307,13 +309,13 @@ def _run_direct_train_step(model: nn.Module, inputs: torch.Tensor) -> torch.Tens
 def _run_split_train_step(runtime: Any, inputs: torch.Tensor) -> torch.Tensor:
     runtime.trace_plan.root_module.zero_grad(set_to_none=True)
     split_inputs = inputs.detach().clone().requires_grad_(True)
-    boundary = runtime.run_prefix(split_inputs)
+    boundary = runtime.run_training_prefix(split_inputs)
     loss, boundary_grads = runtime.train_suffix(
         boundary,
         None,
         loss_fn=lambda outputs, _targets: nested_tensor_loss(outputs),
     )
-    runtime.backward_prefix(split_inputs, boundary_grads=boundary_grads)
+    runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
     return loss.detach()
 
 
@@ -324,7 +326,8 @@ def _run_split_backward_step(
 ) -> None:
     runtime.trace_plan.root_module.zero_grad(set_to_none=True)
     split_inputs = inputs.detach().clone().requires_grad_(True)
-    runtime.backward_prefix(split_inputs, boundary_grads=boundary_grads)
+    boundary = runtime.run_training_prefix(split_inputs)
+    runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
 
 
 def _make_inputs(batch_size: int, input_shape: tuple[int, ...]) -> torch.Tensor:

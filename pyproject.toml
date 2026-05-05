@@ -20,6 +20,9 @@ integration = [
     "torchvision>=0.26.0",
     "ultralytics>=8.4.41",
 ]
+visualization = [
+    "graphviz>=0.20.3",
+]
 
 [project.scripts]
 ariadne = "ariadne:main"

@@ -61,23 +61,34 @@ def train_suffix(
     return loss.detach(), grads
 
 
-def backward_prefix(
+def backward_prefix_from_boundary(
     runtime: Any,
-    inputs: tuple[Any, ...],
+    boundary: BoundaryPayload,
     boundary_grads: BoundaryGradients,
     *,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
-    """Recompute prefix boundary tensors and backpropagate cloud-side gradients."""
+    """Backpropagate boundary gradients through the original prefix graph."""
+    runtime.validate_boundary(boundary)
+    if not boundary.supports_prefix_backward:
+        raise ValueError(
+            "Boundary payload was not produced by run_training_prefix(). "
+            "Call run_training_prefix() and pass that BoundaryPayload to backward_prefix()."
+        )
+    if boundary.prefix_backward_owner_id != runtime.prefix_backward_owner_id:
+        raise ValueError(
+            "Boundary payload was produced by a different SplitRuntime. "
+            "Call backward_prefix() on the same runtime that produced the training boundary."
+        )
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
-    runtime._validate_inputs(inputs)
-    boundary_values = _as_tuple(runtime.prefix_segment(*inputs))
+
     tensors: list[torch.Tensor] = []
     grads: list[torch.Tensor] = []
-    for label, tensor in zip(runtime.segments.boundary_order, boundary_values, strict=True):
+    for label in runtime.segments.boundary_order:
+        tensor = boundary.tensors[label]
         grad = boundary_grads.get(label)
-        if isinstance(tensor, torch.Tensor) and grad is not None:
+        if grad is not None:
             tensors.append(tensor)
             grads.append(grad)
     if tensors:
@@ -92,9 +103,3 @@ def _default_loss(outputs: Any, targets: Any) -> torch.Tensor:
             return F.cross_entropy(outputs, targets)
         return F.mse_loss(outputs, targets)
     raise TypeError("A loss_fn is required for non-tensor outputs or targets.")
-
-
-def _as_tuple(value: Any) -> tuple[Any, ...]:
-    if isinstance(value, tuple):
-        return value
-    return (value,)

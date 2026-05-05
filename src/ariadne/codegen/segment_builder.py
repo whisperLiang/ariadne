@@ -18,6 +18,7 @@ from ariadne.trace.trace_plan import TracePlan
 @dataclass(frozen=True)
 class SegmentBundle:
     prefix: torch.nn.Module
+    training_prefix: torch.nn.Module
     suffix: torch.nn.Module
     boundary_order: tuple[str, ...]
     passthrough_order: tuple[str, ...]
@@ -34,6 +35,15 @@ def build_segments(plan: TracePlan, candidate: SplitCandidate) -> SegmentBundle:
             op_names=candidate.prefix_nodes,
             raw_input_names=plan.input_node_names,
             boundary_order=candidate.boundary_nodes,
+            class_name="PrefixSegment",
+        ),
+        training_prefix=build_interception_prefix(
+            root=plan.root_module,
+            artifact=plan.runtime_artifact,
+            op_names=candidate.prefix_nodes,
+            raw_input_names=plan.input_node_names,
+            boundary_order=candidate.boundary_nodes,
+            class_name="TrainingPrefixSegment",
         ),
         suffix=build_interception_suffix(
             root=plan.root_module,

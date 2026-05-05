@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
+from uuid import uuid4
 
 import torch
 
@@ -13,7 +14,10 @@ from ariadne.codegen.segment_builder import SegmentBundle
 from ariadne.pattern.split_spec import SplitSpec
 from ariadne.planner.frontier import SplitCandidate
 from ariadne.runtime.boundary import BoundaryPayload, validate_boundary_payload
-from ariadne.runtime.train_runtime import backward_prefix, train_suffix
+from ariadne.runtime.train_runtime import (
+    backward_prefix_from_boundary,
+    train_suffix,
+)
 from ariadne.trace.tensor_meta import ShapeExpr
 from ariadne.trace.trace_plan import TracePlan
 
@@ -31,13 +35,22 @@ class SplitRuntime:
     mode: Literal["debug_interpreter", "generated_eager", "compiled"] = "generated_eager"
     variants: tuple[SplitRuntime, ...] = ()
     batch_range: tuple[int, int] | None = None
+    prefix_backward_owner_id: str = field(
+        default_factory=lambda: uuid4().hex,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.mode == "debug_interpreter":
             self.prefix_segment: torch.nn.Module = as_debug_interpreter(self.segments.prefix)
+            self.training_prefix_segment: torch.nn.Module = as_debug_interpreter(
+                self.segments.training_prefix
+            )
             self.suffix_segment: torch.nn.Module = as_debug_interpreter(self.segments.suffix)
         else:
             self.prefix_segment = self.segments.prefix
+            self.training_prefix_segment = self.segments.training_prefix
             self.suffix_segment = self.segments.suffix
 
     @property
@@ -48,6 +61,39 @@ class SplitRuntime:
     def graph_signature(self) -> str:
         return self.trace_plan.graph_signature
 
+    def visualize(
+        self,
+        *,
+        outpath: str = "ariadne_runtime_split_graph",
+        fileformat: str = "svg",
+        view: str = "split",
+        save_only: bool = True,
+        return_dot: bool = False,
+        **kwargs: Any,
+    ) -> str | None:
+        from ariadne.visualization.graphviz_renderer import render_split_graph, render_trace_graph
+
+        if view == "trace":
+            return render_trace_graph(
+                self.trace_plan,
+                outpath=outpath,
+                fileformat=fileformat,
+                save_only=save_only,
+                return_dot=return_dot,
+                **kwargs,
+            )
+        if view == "split":
+            return render_split_graph(
+                self.trace_plan,
+                self.candidate,
+                outpath=outpath,
+                fileformat=fileformat,
+                save_only=save_only,
+                return_dot=return_dot,
+                **kwargs,
+            )
+        raise ValueError("view must be either 'trace' or 'split'.")
+
     def run_prefix(self, *inputs: Any) -> BoundaryPayload:
         batch_size = self._batch_size_from_inputs(inputs)
         variant = self._variant_for_batch(batch_size)
@@ -56,6 +102,36 @@ class SplitRuntime:
 
         self._validate_inputs(inputs)
         boundary_values = _as_tuple(self.prefix_segment(*inputs))
+        return self._make_boundary_payload(
+            inputs,
+            boundary_values,
+            batch_size=batch_size,
+            supports_prefix_backward=False,
+        )
+
+    def run_training_prefix(self, *inputs: Any) -> BoundaryPayload:
+        batch_size = self._batch_size_from_inputs(inputs)
+        variant = self._variant_for_batch(batch_size)
+        if variant is not None:
+            return variant.run_training_prefix(*inputs)
+
+        self._validate_inputs(inputs)
+        boundary_values = _as_tuple(self.training_prefix_segment(*inputs))
+        return self._make_boundary_payload(
+            inputs,
+            boundary_values,
+            batch_size=batch_size,
+            supports_prefix_backward=True,
+        )
+
+    def _make_boundary_payload(
+        self,
+        inputs: tuple[Any, ...],
+        boundary_values: tuple[Any, ...],
+        *,
+        batch_size: int,
+        supports_prefix_backward: bool,
+    ) -> BoundaryPayload:
         tensors = {
             label: value
             for label, value in zip(self.segments.boundary_order, boundary_values, strict=True)
@@ -73,6 +149,10 @@ class SplitRuntime:
             schema=self.candidate.boundary_schema,
             requires_grad={label: tensor.requires_grad for label, tensor in tensors.items()},
             passthrough_inputs=passthrough_inputs,
+            supports_prefix_backward=supports_prefix_backward,
+            prefix_backward_owner_id=(
+                self.prefix_backward_owner_id if supports_prefix_backward else None
+            ),
         )
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
@@ -106,18 +186,24 @@ class SplitRuntime:
 
     def backward_prefix(
         self,
-        *inputs: Any,
+        boundary: BoundaryPayload,
         boundary_grads: BoundaryGradients | None = None,
+        *,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
-        raw_inputs, grads = _normalize_backward_prefix_args(inputs, boundary_grads)
-        batch_size = self._batch_size_from_inputs(raw_inputs)
-        variant = self._variant_for_batch(batch_size)
+        if not isinstance(boundary, BoundaryPayload):
+            raise TypeError(
+                "backward_prefix requires a BoundaryPayload from run_training_prefix()."
+            )
+        if boundary_grads is None:
+            raise TypeError("backward_prefix requires boundary_grads.")
+
+        variant = self._variant_for_boundary(boundary)
         if variant is not None:
-            variant.backward_prefix(*raw_inputs, boundary_grads=grads, optimizer=optimizer)
+            variant.backward_prefix(boundary, boundary_grads=boundary_grads, optimizer=optimizer)
             return
 
-        backward_prefix(self, raw_inputs, grads, optimizer=optimizer)
+        backward_prefix_from_boundary(self, boundary, boundary_grads, optimizer=optimizer)
 
     def validate_boundary(self, boundary: BoundaryPayload) -> None:
         validate_boundary_payload(
@@ -200,19 +286,3 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
     if isinstance(value, tuple):
         return value
     return (value,)
-
-
-def _normalize_backward_prefix_args(
-    inputs: tuple[Any, ...],
-    boundary_grads: BoundaryGradients | None,
-) -> tuple[tuple[Any, ...], BoundaryGradients]:
-    if boundary_grads is not None:
-        return inputs, boundary_grads
-    if not inputs:
-        raise TypeError("backward_prefix requires raw inputs and boundary gradients.")
-    *raw_inputs, maybe_grads = inputs
-    if not isinstance(maybe_grads, dict):
-        raise TypeError(
-            "Pass boundary gradients as the final positional argument or as boundary_grads=..."
-        )
-    return tuple(raw_inputs), maybe_grads

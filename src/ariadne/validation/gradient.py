@@ -24,9 +24,9 @@ def assert_gradient_equivalent(
     direct_loss = loss_fn(direct_model(*direct_inputs), targets)
     direct_loss.backward()
 
-    boundary = split_runtime.run_prefix(*split_inputs)
+    boundary = split_runtime.run_training_prefix(*split_inputs)
     _, boundary_grads = split_runtime.train_suffix(boundary, targets, loss_fn=loss_fn)
-    split_runtime.backward_prefix(*split_inputs, boundary_grads=boundary_grads)
+    split_runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
 
     direct_params = dict(direct_model.named_parameters())
     split_params = dict(split_runtime.trace_plan.root_module.named_parameters())

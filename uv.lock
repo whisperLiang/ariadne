@@ -62,7 +62,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ariadne"
+name = "ariadne-split"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -79,6 +79,9 @@ integration = [
     { name = "torchvision" },
     { name = "ultralytics" },
 ]
+visualization = [
+    { name = "graphviz" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -90,6 +93,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "graphviz", marker = "extra == 'visualization'", specifier = ">=0.20.3" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "rfdetr", marker = "extra == 'integration'", specifier = ">=1.6.5" },
     { name = "timm", marker = "extra == 'integration'", specifier = ">=1.0.26" },
@@ -98,7 +102,7 @@ requires-dist = [
     { name = "typing-extensions", specifier = ">=4.15.0" },
     { name = "ultralytics", marker = "extra == 'integration'", specifier = ">=8.4.41" },
 ]
-provides-extras = ["integration"]
+provides-extras = ["integration", "visualization"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -696,6 +700,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e1/cf/b50ddf667c15276a9ab15a70ef5f257564de271957933ffea49d2cdbcdfb/fsspec-2026.3.0.tar.gz", hash = "sha256:1ee6a0e28677557f8c2f994e3eea77db6392b4de9cd1f5d7a9e87a0ae9d01b41", size = 313547, upload-time = "2026-03-27T19:11:14.892Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/1f/5f4a3cd9e4440e9d9bc78ad0a91a1c8d46b4d429d5239ebe6793c9fe5c41/fsspec-2026.3.0-py3-none-any.whl", hash = "sha256:d2ceafaad1b3457968ed14efa28798162f1638dbb5d2a6868a2db002a5ee39a4", size = 202595, upload-time = "2026-03-27T19:11:13.595Z" },
+]
+
+[[package]]
+name = "graphviz"
+version = "0.21"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/b3/3ac91e9be6b761a4b30d66ff165e54439dcd48b83f4e20d644867215f6ca/graphviz-0.21.tar.gz", hash = "sha256:20743e7183be82aaaa8ad6c93f8893c923bd6658a04c32ee115edb3c8a835f78", size = 200434, upload-time = "2025-06-15T09:35:05.824Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/4c/e0ce1ef95d4000ebc1c11801f9b944fa5910ecc15b5e351865763d8657f8/graphviz-0.21-py3-none-any.whl", hash = "sha256:54f33de9f4f911d7e84e4191749cac8cc5653f815b06738c54db9a15ab8b1e42", size = 47300, upload-time = "2025-06-15T09:35:04.433Z" },
 ]
 
 [[package]]

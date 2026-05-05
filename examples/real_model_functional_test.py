@@ -60,13 +60,13 @@ def assert_split_train_equivalent(
 
     model.zero_grad(set_to_none=True)
     split_inputs = x.detach().clone().requires_grad_(True)
-    boundary = runtime.run_prefix(split_inputs)
+    boundary = runtime.run_training_prefix(split_inputs)
     split_loss, boundary_grads = runtime.train_suffix(
         boundary,
         None,
         loss_fn=lambda outputs, _targets: nested_tensor_loss(outputs),
     )
-    runtime.backward_prefix(split_inputs, boundary_grads=boundary_grads)
+    runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
 
     torch.testing.assert_close(split_loss, direct_loss.detach(), rtol=rtol, atol=atol)
     for name, parameter in model.named_parameters():

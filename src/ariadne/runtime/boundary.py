@@ -21,6 +21,8 @@ class BoundaryPayload:
     requires_grad: dict[str, bool]
     weight_version: int | None = None
     passthrough_inputs: dict[str, Any] = field(default_factory=dict)
+    supports_prefix_backward: bool = False
+    prefix_backward_owner_id: str | None = field(default=None, repr=False)
 
 
 def validate_boundary_payload(

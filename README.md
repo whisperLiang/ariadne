@@ -35,11 +35,13 @@ generates executable segments so runtime work stays simple:
 
 ### Quick Start (Users)
 
-Install Ariadne from PyPI:
+Install Ariadne from PyPI with `uv`:
 
 ```bash
-pip install ariadne-split
+uv add ariadne-split
 ```
+
+If you are not using a `uv` project, `pip install ariadne-split` works too.
 
 After installation, you can import and use Ariadne:
 
@@ -55,8 +57,19 @@ import torch
 For real-model integration tests (YOLOv8n, RF-DETR, timm models, torchvision), install with the `integration` extra:
 
 ```bash
-pip install ariadne-split[integration]
+uv add "ariadne-split[integration]"
 ```
+
+For operation-level TracePlan and split-candidate visualization, install with the
+`visualization` extra:
+
+```bash
+uv add "ariadne-split[visualization]"
+```
+
+The visualization extra installs the Python `graphviz` package. Rendering SVG,
+PDF, or PNG files also requires the Graphviz system executable on `PATH`. DOT
+export does not require the system executable.
 
 ### Development Setup (Contributors)
 
@@ -83,6 +96,7 @@ Useful demo commands:
 ```bash
 uv run python examples/split_inference_demo.py
 uv run python examples/split_training_demo.py
+uv run --extra integration --extra visualization python examples/visualize_trace_demo.py --model resnet18
 ```
 
 Optional real-model smoke checks install the `integration` extra and may download
@@ -94,6 +108,13 @@ and `torchvision deeplabv3_resnet50`:
 uv run --extra integration python examples/real_model_functional_test.py
 uv run --extra integration python examples/real_model_timing.py --iterations 3 --warmup 1
 ARIADNE_RUN_REAL_MODELS=1 uv run --extra integration pytest tests/integration -m integration
+```
+
+Visualization also has optional real-model smoke tests using torchvision
+`resnet18` and `vgg11`:
+
+```bash
+ARIADNE_RUN_REAL_MODELS=1 uv run --extra integration --extra visualization pytest tests/integration/test_visualization_real_models.py -m integration
 ```
 
 ## Basic Split Inference
@@ -126,7 +147,7 @@ output = runtime.run_suffix(boundary)
 ```python
 import torch.nn.functional as F
 
-boundary = runtime.run_prefix(x_batch)
+boundary = runtime.run_training_prefix(x_batch)
 loss, boundary_grads = runtime.train_suffix(
     boundary,
     targets,
@@ -134,11 +155,61 @@ loss, boundary_grads = runtime.train_suffix(
     optimizer=suffix_optimizer,
 )
 runtime.backward_prefix(
-    x_batch,
+    boundary,
     boundary_grads=boundary_grads,
     optimizer=prefix_optimizer,
 )
 ```
+
+For split training, use `run_training_prefix()` so the boundary keeps the
+original prefix autograd graph. Then `backward_prefix(boundary, ...)` applies
+the suffix boundary gradients directly to that graph without recomputing prefix
+operations. This matters for RNG-sensitive training operations such as
+`nn.Dropout`, where recomputing prefix would sample a different random mask.
+The lightweight `run_prefix()` path is still available for split replay and
+inference-style boundary generation.
+
+## Visualization
+
+Ariadne can export offline operation-level views of a captured `TracePlan` and
+the selected split candidate. Visualization reads metadata already stored in
+`TracePlan`, `TraceNode`, and `SplitCandidate`; it does not re-trace the model,
+does not run generated segments, and does not store real activations or tensors.
+
+The most direct path is through a prepared runtime:
+
+```python
+runtime.visualize(view="trace", outpath="trace_graph", fileformat="svg")
+runtime.visualize(view="split", outpath="split_graph", fileformat="svg")
+```
+
+For tests, notebooks, and debugging environments where the Graphviz system
+binary is unavailable, request DOT source instead:
+
+```python
+trace_dot = runtime.visualize(view="trace", return_dot=True)
+split_dot = runtime.visualize(view="split", return_dot=True)
+```
+
+The public export helpers can also be used directly:
+
+```python
+from ariadne.visualization import (
+    export_split_candidates_table,
+    export_split_dot,
+    export_trace_dot,
+)
+
+trace_dot = export_trace_dot(runtime.trace_plan)
+split_dot = export_split_dot(runtime.trace_plan, runtime.candidate)
+candidates = export_split_candidates_table(runtime.trace_plan)
+```
+
+Split visualizations mark prefix, suffix, boundary, and passthrough nodes and
+include lightweight cost information such as `boundary_bytes`, prefix/suffix
+node counts, and whether the suffix is trainable. Node labels prefer model
+definition information such as module path and module type (`layer1.0.conv1:
+Conv2d`) while keeping the captured ATen target as secondary debugging context.
 
 ## Dynamic Batch
 

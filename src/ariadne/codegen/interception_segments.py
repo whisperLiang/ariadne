@@ -111,6 +111,7 @@ def build_interception_prefix(
     op_names: Iterable[str],
     raw_input_names: tuple[str, ...],
     boundary_order: tuple[str, ...],
+    class_name: str,
 ) -> GeneratedInterceptionSegment:
     selected_ops = _select_ops(artifact, op_names)
     return GeneratedInterceptionSegment(
@@ -119,7 +120,7 @@ def build_interception_prefix(
         ops=selected_ops,
         input_names=raw_input_names,
         output_template=tuple(materialize_name(name) for name in boundary_order),
-        class_name="PrefixSegment",
+        class_name=class_name,
     )
 
 
