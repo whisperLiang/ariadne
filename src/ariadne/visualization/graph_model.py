@@ -7,8 +7,22 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class RenderParam:
+    name: str
+    shape: tuple[Any, ...]
+    trainable: bool
+
+
+@dataclass(frozen=True)
+class RenderBuffer:
+    name: str
+    shape: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
 class RenderNode:
     name: str
+    source_names: tuple[str, ...]
     index: int
     op: str
     target: str
@@ -20,6 +34,8 @@ class RenderNode:
     nbytes: int | None
     param_count: int
     buffer_count: int
+    param_refs: tuple[RenderParam, ...]
+    buffer_refs: tuple[RenderBuffer, ...]
     is_placeholder: bool
     is_output: bool
     is_attr: bool

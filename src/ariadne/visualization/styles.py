@@ -7,40 +7,47 @@ import re
 from ariadne.visualization.graph_model import RenderEdge, RenderNode
 
 
-def node_label(node: RenderNode, show_tensor_meta: bool, show_param_refs: bool) -> str:
-    parts = [f"{_display_name(node)}  #{node.index}", _display_kind(node)]
-    if node.is_compute:
-        parts.append(f"aten: {node.target}")
-    markers: list[str] = []
-    if node.rng_sensitive:
-        markers.append("rng")
-    if node.has_mutation_metadata:
-        markers.append("mutation")
-    if node.has_alias_metadata:
-        markers.append("alias")
-    if markers:
-        parts.append(f"[!] {', '.join(markers)}")
-    if node.module_path is not None:
-        parts.append(f"trace node: {node.name}")
+def node_label(
+    node: RenderNode,
+    show_tensor_meta: bool,
+    show_param_refs: bool,
+    show_operation_targets: bool = False,
+    show_debug_markers: bool = False,
+    show_node_indices: bool = False,
+) -> str:
+    parts = [_title_line(node, show_node_indices=show_node_indices)]
+    if node.is_compute and show_operation_targets:
+        parts.append(f"op: {_friendly_target(node.target)}")
+    if show_debug_markers:
+        markers: list[str] = []
+        if node.rng_sensitive:
+            markers.append("rng")
+        if node.has_mutation_metadata:
+            markers.append("mutation")
+        if node.has_alias_metadata:
+            markers.append("alias")
+        if markers:
+            parts.append(f"[!] {', '.join(markers)}")
+    if show_operation_targets and node.module_path is not None:
+        parts.append(_trace_node_label(node))
     if show_tensor_meta and node.symbolic_shape is not None:
-        shape = ", ".join(str(dim) for dim in node.symbolic_shape)
-        meta = f"shape: ({shape})"
-        if node.dtype is not None:
-            meta = f"{meta}\ndtype: {node.dtype}"
-        if node.nbytes is not None:
-            meta = f"{meta}\nnbytes: {node.nbytes}"
-        parts.append(meta)
-    if show_param_refs and (node.param_count or node.buffer_count):
-        parts.append(f"params: {node.param_count}\nbuffers: {node.buffer_count}")
+        parts.append(_tensor_meta_line(node))
+    if show_param_refs:
+        param_line = _param_line(node)
+        if param_line:
+            parts.append(param_line)
     return "\n".join(parts)
 
 
 def node_attrs(node: RenderNode, split_role: str | None = None) -> dict[str, str]:
     attrs = {
-        "shape": "box",
+        "shape": _node_shape(node),
         "style": "filled",
         "fontname": "Helvetica",
         "fontsize": "10",
+        "margin": "0.08,0.04",
+        "width": "2.15",
+        "height": "0.62",
         "color": "#9CA3AF",
         "fillcolor": "#FFFFFF",
         "ariadne_node_type": _node_type(node),
@@ -100,7 +107,11 @@ def cluster_name(module_path: str) -> str:
 
 
 def _display_name(node: RenderNode) -> str:
-    return node.module_path or node.name
+    if node.module_path is not None:
+        return node.module_path
+    if node.is_compute:
+        return _friendly_target(node.target)
+    return node.name
 
 
 def _display_kind(node: RenderNode) -> str:
@@ -115,8 +126,23 @@ def _display_kind(node: RenderNode) -> str:
     return _friendly_target(node.target)
 
 
+def _title_line(node: RenderNode, *, show_node_indices: bool) -> str:
+    display_name = _display_name(node)
+    display_kind = _display_kind(node)
+    if node.is_compute and display_name == display_kind:
+        title = display_kind
+    else:
+        title = f"{display_name}: {display_kind}"
+    if show_node_indices:
+        return f"{title}  #{node.index}"
+    return title
+
+
 def _friendly_target(target: str) -> str:
-    return target.removesuffix(".default")
+    friendly = target.removeprefix("aten.")
+    friendly = friendly.removesuffix(".default")
+    friendly = friendly.split(".", 1)[0]
+    return friendly.removesuffix("_")
 
 
 def _node_type(node: RenderNode) -> str:
@@ -126,7 +152,96 @@ def _node_type(node: RenderNode) -> str:
         return "output"
     if node.is_attr:
         return "get_attr"
+    if node.op == "module":
+        return "module"
     return "compute"
+
+
+def _node_shape(node: RenderNode) -> str:
+    if node.op == "module":
+        return "box3d"
+    if node.is_compute and node.module_path is None:
+        return "ellipse"
+    return "box"
+
+
+def _trace_node_label(node: RenderNode) -> str:
+    if len(node.source_names) == 1:
+        return f"trace node: {node.source_names[0]}"
+    return f"trace nodes: {len(node.source_names)}"
+
+
+def _param_line(node: RenderNode) -> str:
+    if not node.param_refs:
+        return ""
+    if len(node.param_refs) > 3:
+        return _param_summary_line(node)
+    parts = []
+    for ref in node.param_refs:
+        wrapper = ("(", ")") if ref.trainable else ("[", "]")
+        name = _short_ref_name(node, ref.name)
+        shape = _format_shape(ref.shape)
+        parts.append(f"{name}{wrapper[0]}{shape}{wrapper[1]}")
+    return "params: " + ", ".join(parts)
+
+
+def _param_summary_line(node: RenderNode) -> str:
+    total = sum(_numel(ref.shape) for ref in node.param_refs)
+    trainable = sum(_numel(ref.shape) for ref in node.param_refs if ref.trainable)
+    if total == trainable:
+        return f"params: {_format_count(total)}"
+    if trainable == 0:
+        return f"params: {_format_count(total)} frozen"
+    return f"params: {_format_count(total)} ({_format_count(trainable)} trainable)"
+
+
+def _tensor_meta_line(node: RenderNode) -> str:
+    shape = ", ".join(str(dim) for dim in node.symbolic_shape or ())
+    if node.nbytes is None:
+        return f"({shape})"
+    return f"({shape}) | {_format_mb(node.nbytes)}"
+
+
+def _short_ref_name(node: RenderNode, name: str) -> str:
+    if node.module_path is not None:
+        prefix = f"{node.module_path}."
+        if name.startswith(prefix):
+            return name.removeprefix(prefix)
+    return name.rsplit(".", 1)[-1]
+
+
+def _format_mb(nbytes: int) -> str:
+    mb = nbytes / (1024 * 1024)
+    if 0 < mb < 0.001:
+        return "<0.001 MB"
+    return f"{mb:.3f} MB"
+
+
+def _format_shape(shape: tuple[object, ...]) -> str:
+    if len(shape) > 1:
+        return "x".join(str(dim) for dim in shape)
+    if len(shape) == 1:
+        return f"x{shape[0]}"
+    return "x1"
+
+
+def _numel(shape: tuple[object, ...]) -> int:
+    total = 1
+    for dim in shape:
+        if not isinstance(dim, int):
+            return 0
+        total *= dim
+    return total
+
+
+def _format_count(count: int) -> str:
+    if count >= 1_000_000:
+        value = count / 1_000_000
+        return f"{value:.2f}M"
+    if count >= 1_000:
+        value = count / 1_000
+        return f"{value:.1f}K"
+    return str(count)
 
 
 def _apply_split_role(attrs: dict[str, str], split_role: str) -> None:

@@ -205,11 +205,44 @@ split_dot = export_split_dot(runtime.trace_plan, runtime.candidate)
 candidates = export_split_candidates_table(runtime.trace_plan)
 ```
 
+Visualizations default to a module-structure view inspired by TorchLens: traced
+operations are folded back into `nn.Module` paths, and deep module hierarchies
+are collapsed to a readable nesting depth by default. For example, ResNet-style
+blocks render as `layer1.0` `BasicBlock` clusters containing `conv`, `bn`,
+`relu`, residual `add`, and `downsample` nodes, instead of a raw ATen operator
+stream or a single opaque block. Labels omit ATen targets, trace node indices,
+mutation/debug markers, dtype, raw byte counts, and buffers by default. Node
+rows stay compact: module/type on the first line, symbolic shape plus activation
+memory in MB on the second line, and shortened parameter rows such as
+`params: weight(64x3x7x7), bias(x64)` or `params: 74.0K` for explicitly
+collapsed modules. Trainable parameters use parentheses and frozen parameters
+use square brackets.
+
+When you need low-level debugging, request the operation view explicitly:
+
+```python
+runtime.visualize(
+    view="trace",
+    view_detail="operation",
+    show_operation_targets=True,
+    show_debug_markers=True,
+    show_node_indices=True,
+    outpath="trace_ops",
+)
+```
+
+Use `max_module_depth` to collapse deep model hierarchies into coarser module
+nodes, similar to TorchLens nesting-depth controls. Pass `None` to expand the
+nested module clusters:
+
+```python
+runtime.visualize(view="split", max_module_depth=2)  # collapse BasicBlock nodes
+runtime.visualize(view="trace", max_module_depth=None)
+```
+
 Split visualizations mark prefix, suffix, boundary, and passthrough nodes and
 include lightweight cost information such as `boundary_bytes`, prefix/suffix
-node counts, and whether the suffix is trainable. Node labels prefer model
-definition information such as module path and module type (`layer1.0.conv1:
-Conv2d`) while keeping the captured ATen target as secondary debugging context.
+node counts, and whether the suffix is trainable.
 
 ## Dynamic Batch
 

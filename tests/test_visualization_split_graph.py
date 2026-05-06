@@ -43,6 +43,11 @@ def test_export_split_dot_contains_split_overlay_metadata() -> None:
     assert 'ariadne_split_role="prefix"' in dot
     assert 'ariadne_split_role="suffix"' in dot
     assert 'ariadne_split_role="boundary"' in dot
+    assert "aten:" not in dot
+    assert "dtype:" not in dot
+    assert "buffers:" not in dot
+    assert "layout_order" not in dot
+    assert "params: weight(8x5), bias(x8)" in dot
     assert "detach.default" not in dot
 
 

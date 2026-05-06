@@ -35,6 +35,15 @@ def test_torchvision_resnet18_split_visualization_dot() -> None:
 
     assert runtime.candidate.split_id in dot
     assert "layer1" in dot
+    assert 'label="layer1.0\\n(BasicBlock)"' in dot
+    assert "layer1.0.conv1: Conv2d" in dot
+    assert "layer1.0.bn1: BatchNorm2d" in dot
+    assert "layer1.0: add" in dot
+    assert "layer2.0.downsample.0: Conv2d" in dot
+    assert "layer2.0.downsample.1: BatchNorm2d" in dot
+    assert "layer2.0.downsample: Sequential" not in dot
+    assert "module__layer1_0_relu__call_2" in dot
+    assert "layer1.0: BasicBlock\\n(B" not in dot
     assert "Conv2d" in dot
     assert "BatchNorm2d" in dot
     assert "boundary_bytes" in dot
@@ -67,8 +76,10 @@ def test_torchvision_vgg11_trace_and_render_visualization_dot() -> None:
 
     assert "features.0" in trace_dot
     assert "features.3" in trace_dot
-    assert trace_dot.count('label="features.2  #') == 1
-    assert trace_dot.count("max_pool2d_with_indices.default") == 5
+    assert trace_dot.count('label="features.2: MaxPool2d') == 1
+    assert "max_pool2d_with_indices.default" not in trace_dot
+    assert "aten:" not in trace_dot
+    assert "layout_order" not in trace_dot
     assert trace_dot.count("Linear") == 3
     assert "t.default" not in trace_dot
     assert "detach.default" not in trace_dot

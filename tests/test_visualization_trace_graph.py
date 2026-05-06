@@ -58,15 +58,32 @@ def test_export_trace_dot_contains_trace_metadata_and_edges() -> None:
     dot = export_trace_dot(plan)
 
     assert plan.graph_signature in dot
+    assert 'rankdir="BT"' in dot
+    assert 'ordering="out"' in dot
     assert "input_0" in dot
     assert "output" in dot
-    assert '"input_0" -> "node_' in dot
+    assert "view=module" in dot
+    assert '"input_0" -> "module__layer1"' in dot
     assert "layer1" in dot
     assert "Linear" in dot
     assert dot.count("Linear") == 2
     assert "call_function" not in dot
+    assert "aten:" not in dot
+    assert "dtype:" not in dot
+    assert "nbytes:" not in dot
+    assert "buffers:" not in dot
+    assert "layout_order" not in dot
+    assert "addmm.default" not in dot
     assert "detach.default" not in dot
     assert "t.default" not in dot
+    assert "layer1: Linear" in dot
+    assert "layer1: Linear  #" not in dot
+    assert "(B, 8) | <0.001 MB" in dot
+    assert "params: weight(8x5), bias(x8)" in dot
+    assert "params: 1" not in dot
+
+    debug_dot = export_trace_dot(plan, show_node_indices=True)
+    assert "layer1: Linear  #" in debug_dot
 
 
 def test_render_trace_graph_return_dot_contains_trace_metadata() -> None:
@@ -99,7 +116,14 @@ def test_export_trace_dot_collapses_unused_maxpool_indices_output() -> None:
     dot = export_trace_dot(plan)
 
     assert dot.count("MaxPool2d") == 1
-    assert dot.count("max_pool2d_with_indices.default") == 1
+    assert "max_pool2d_with_indices.default" not in dot
+
+    operation_dot = export_trace_dot(
+        plan,
+        view_detail="operation",
+        show_operation_targets=True,
+    )
+    assert operation_dot.count("op: max_pool2d_with_indices") == 1
 
 
 def test_export_trace_dot_collapses_generic_unused_multi_output() -> None:
@@ -127,5 +151,5 @@ def test_export_trace_dot_collapses_unused_batchnorm_auxiliary_outputs() -> None
     dot = export_trace_dot(plan)
 
     assert dot.count("BatchNorm2d") == 1
-    assert dot.count("native_batch_norm.default") == 1
+    assert "native_batch_norm.default" not in dot
     assert "empty.memory_format" not in dot
