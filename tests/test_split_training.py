@@ -61,6 +61,36 @@ def test_split_training_matches_full_backward() -> None:
     )
 
 
+def test_compiled_split_training_matches_full_backward_with_aot_eager() -> None:
+    torch.manual_seed(0)
+    direct_model = TinyNet()
+    split_model = copy.deepcopy(direct_model)
+    x_direct = torch.randn(4, 5, requires_grad=True)
+    x_split = x_direct.detach().clone().requires_grad_(True)
+    targets = torch.randn(4, 3)
+    runtime = prepare_split(
+        split_model,
+        example_inputs=(x_split,),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+        mode="compiled",
+        compile_options={"backend": "aot_eager", "dynamic": True},
+    )
+
+    assert_gradient_equivalent(
+        direct_model,
+        runtime,
+        (x_direct,),
+        (x_split,),
+        targets,
+        loss_fn=F.mse_loss,
+    )
+
+
 def test_backward_prefix_accepts_prompt_style_positional_gradients() -> None:
     model = TinyNet()
     x = torch.randn(4, 5, requires_grad=True)

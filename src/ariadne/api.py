@@ -7,11 +7,15 @@ from typing import Any, Literal
 
 import torch
 
-from ariadne.codegen.segment_builder import build_segments
+from ariadne.codegen.segment_builder import build_replay_segments, build_segments
 from ariadne.compiler.torch_compile import maybe_compile_segments
 from ariadne.pattern.split_spec import SplitSpec
 from ariadne.pattern.validator import validate_split_spec
 from ariadne.planner.selector import select_split
+from ariadne.runtime.replay_runtime import (
+    ReplayValidationMode,
+    SplitReplayRuntime,
+)
 from ariadne.runtime.segment_runtime import SplitRuntime
 from ariadne.trace.trace_plan import TracePlan
 from ariadne.trace.tracer import trace_model
@@ -77,6 +81,73 @@ def prepare_split(
     )
 
 
+def prepare_split_replay(
+    model: torch.nn.Module,
+    *,
+    example_inputs: Sequence[Any],
+    split: SplitSpec | str,
+    mode: ExecutionMode = "compiled",
+    objective: Mapping[str, Any] | None = None,
+    compile_options: Mapping[str, Any] | None = None,
+    validation: ReplayValidationMode = "fast",
+    materialize_boundary: bool = True,
+) -> SplitReplayRuntime:
+    """Prepare an inference-only split replay runtime.
+
+    This path skips split-retain/training-prefix construction and packages
+    boundary values in tuple order for lower-overhead replay.
+    """
+    if mode not in {"debug_interpreter", "generated_eager", "compiled"}:
+        raise ValueError(
+            "mode must be one of 'debug_interpreter', 'generated_eager', or 'compiled'"
+        )
+
+    spec = _normalize_split_spec(split)
+    validate_split_spec(spec)
+    _validate_trace_batch_mode(spec, tuple(example_inputs))
+
+    plan = trace_model(
+        model,
+        example_inputs=tuple(example_inputs),
+        batch_symbol=spec.batch_symbol,
+        dynamic_batch=spec.dynamic_batch,
+        trace_batch_mode=spec.trace_batch_mode,
+    )
+    runtime = _prepare_replay_runtime_from_plan(
+        plan,
+        spec=spec,
+        split=split,
+        objective=objective,
+        mode=mode,
+        compile_options=compile_options,
+        validation=validation,
+        materialize_boundary=materialize_boundary,
+    )
+    variants = _prepare_replay_batch_variants(
+        model,
+        example_inputs=tuple(example_inputs),
+        spec=spec,
+        split=split,
+        objective=objective,
+        mode=mode,
+        compile_options=compile_options,
+        validation=validation,
+        materialize_boundary=materialize_boundary,
+    )
+
+    return SplitReplayRuntime(
+        trace_plan=runtime.trace_plan,
+        split_spec=runtime.split_spec,
+        candidate=runtime.candidate,
+        segments=runtime.segments,
+        mode=runtime.mode,
+        validation=runtime.validation,
+        materialize_boundary=runtime.materialize_boundary,
+        compile_options=dict(compile_options or {}),
+        variants=variants,
+    )
+
+
 def _normalize_split_spec(split: SplitSpec | str) -> SplitSpec:
     if isinstance(split, SplitSpec):
         return split
@@ -104,6 +175,33 @@ def _prepare_runtime_from_plan(
         candidate=candidate,
         segments=segments,
         mode=mode,
+        batch_range=batch_range,
+    )
+
+
+def _prepare_replay_runtime_from_plan(
+    plan: TracePlan,
+    *,
+    spec: SplitSpec,
+    split: SplitSpec | str,
+    objective: Mapping[str, Any] | None,
+    mode: ExecutionMode,
+    compile_options: Mapping[str, Any] | None,
+    validation: ReplayValidationMode,
+    materialize_boundary: bool,
+    batch_range: tuple[int, int] | None = None,
+) -> SplitReplayRuntime:
+    candidate = select_split(plan, split=spec if split != "auto" else "auto", objective=objective)
+    segments = build_replay_segments(plan, candidate)
+    return SplitReplayRuntime(
+        trace_plan=plan,
+        split_spec=spec,
+        candidate=candidate,
+        segments=segments,
+        mode=mode,
+        validation=validation,
+        materialize_boundary=materialize_boundary,
+        compile_options=dict(compile_options or {}),
         batch_range=batch_range,
     )
 
@@ -145,6 +243,52 @@ def _prepare_batch_variants(
             objective=objective,
             mode=mode,
             compile_options=compile_options,
+            batch_range=(variant_batch, high),
+        ),
+    )
+
+
+def _prepare_replay_batch_variants(
+    model: torch.nn.Module,
+    *,
+    example_inputs: tuple[Any, ...],
+    spec: SplitSpec,
+    split: SplitSpec | str,
+    objective: Mapping[str, Any] | None,
+    mode: ExecutionMode,
+    compile_options: Mapping[str, Any] | None,
+    validation: ReplayValidationMode,
+    materialize_boundary: bool,
+) -> tuple[SplitReplayRuntime, ...]:
+    if spec.trace_batch_mode != "batch_1" or spec.dynamic_batch is None:
+        return ()
+    traced_batch = _first_batch_size(example_inputs)
+    if traced_batch != 1:
+        return ()
+    low, high = spec.dynamic_batch
+    if high < 2:
+        return ()
+    variant_batch = max(2, low)
+    if variant_batch > high:
+        return ()
+    variant_inputs = _resize_batch(example_inputs, traced_batch, variant_batch)
+    variant_plan = trace_model(
+        model,
+        example_inputs=variant_inputs,
+        batch_symbol=spec.batch_symbol,
+        dynamic_batch=spec.dynamic_batch,
+        trace_batch_mode=spec.trace_batch_mode,
+    )
+    return (
+        _prepare_replay_runtime_from_plan(
+            variant_plan,
+            spec=spec,
+            split=split,
+            objective=objective,
+            mode=mode,
+            compile_options=compile_options,
+            validation=validation,
+            materialize_boundary=materialize_boundary,
             batch_range=(variant_batch, high),
         ),
     )

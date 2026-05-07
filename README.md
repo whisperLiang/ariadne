@@ -271,11 +271,51 @@ part of `RuntimeCacheKey`.
 
 ## Execution Modes
 
-- `debug_interpreter`: slow interpreter execution for validation and debugging.
-- `generated_eager`: default generated prefix/suffix segment execution.
-- `compiled`: applies `torch.compile` to generated segments after preparation.
+Ariadne lets users choose between non-compiled generated execution and
+`torch.compile` optimized execution at preparation time:
 
-Example:
+- `debug_interpreter`: slow interpreter execution for validation and debugging.
+- `generated_eager`: default generated prefix/suffix segment execution. Use this
+  for short-lived scripts, CPU-only environments, correctness checks, or when
+  the expected number of calls is too small to pay back compile cost.
+- `compiled`: applies `torch.compile` to generated segments after preparation.
+  Use this for long-lived GPU services or repeated same-model, same-shape
+  workloads where startup warmup can happen outside the online request path.
+
+Split retain training uses `prepare_split(...)` in either mode:
+
+```python
+runtime = prepare_split(
+    model,
+    example_inputs=(x,),
+    split=spec,
+    mode="generated_eager",  # or "compiled"
+)
+```
+
+Inference-only split replay can use `prepare_split_replay(...)`. Compiled replay
+uses segment-level compilation, so `run_prefix()` still returns a lightweight
+`ReplayBoundary` and `run_suffix(boundary)` consumes that explicit intermediate
+feature object:
+
+```python
+from ariadne import prepare_split_replay
+
+replay_runtime = prepare_split_replay(
+    model,
+    example_inputs=(x,),
+    split=spec,
+    mode="compiled",  # or "generated_eager"
+)
+
+replay_runtime.warmup(x)              # trigger compile before measuring/serving
+boundary = replay_runtime.run_prefix(x)
+output = replay_runtime.run_suffix(boundary)
+```
+
+The default compiled replay options target low-overhead GPU inference with
+Inductor. Custom options can still be passed when a deployment needs a different
+backend or stricter control:
 
 ```python
 runtime = prepare_split(
@@ -285,6 +325,39 @@ runtime = prepare_split(
     mode="compiled",
     compile_options={"backend": "inductor", "mode": "reduce-overhead", "dynamic": True},
 )
+```
+
+### Choosing Eager or Compiled
+
+`torch.compile` changes where time is spent: the steady-state calls can be
+faster, but the first compiled call pays a cold-start cost. Ariadne benchmarks
+therefore report both steady-state latency and compile overhead.
+
+- Choose `generated_eager` when the process handles only a few batches, when
+  startup latency matters more than steady-state throughput, or when the target
+  CPU/GPU toolchain does not compile reliably.
+- Choose `compiled` when the runtime is reused for many calls, especially on
+  CUDA GPUs. For replay runtimes, call `warmup(...)` during service startup;
+  for split retain, run one representative training round before measuring or
+  serving latency-sensitive traffic.
+- Benchmark the target machine before setting a global default. CPU
+  `torch.compile` may work in some environments, but it is not automatically
+  faster and may require a working native compiler stack.
+
+Measure steady-state replay optimization:
+
+```bash
+uv run --extra integration python examples/replay_optimization_timing.py \
+  --models resnet50 mobilenet --batches 4 32 256 \
+  --iterations 50 --warmup 20 --backend torch_compile
+```
+
+Measure compile overhead and break-even iterations:
+
+```bash
+uv run --extra integration python examples/compile_overhead_timing.py \
+  --models resnet50 mobilenet --modes replay retain --batches 4 32 256 \
+  --iterations 20 --warmup 5 --require-cuda
 ```
 
 ## Benchmarking
