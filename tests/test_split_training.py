@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from ariadne import SplitSpec, prepare_split
+from ariadne.planner.frontier import enumerate_frontier_splits
+from ariadne.trace.tracer import trace_model
 from ariadne.validation.gradient import assert_gradient_equivalent
 
 
@@ -31,6 +33,18 @@ class DropoutNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.drop(self.fc1(x)))
+
+
+class DetachedBoundaryNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prefix = nn.Linear(5, 8)
+        self.suffix = nn.Linear(8, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.prefix(x)
+        detached = torch.ones_like(y).detach()
+        return self.suffix(y + detached)
 
 
 def test_split_training_matches_full_backward() -> None:
@@ -157,6 +171,47 @@ def test_backward_prefix_rejects_training_boundary_from_other_runtime() -> None:
     with pytest.raises(ValueError, match="different SplitRuntime"):
         runtime_b.backward_prefix(boundary, boundary_grads=boundary_grads)
     assert model_b.layer1.weight.grad is None
+
+
+def test_backward_prefix_ignores_non_grad_boundary_tensors() -> None:
+    model = DetachedBoundaryNet()
+    x = torch.randn(4, 5, requires_grad=True)
+    plan = trace_model(
+        model,
+        example_inputs=(x,),
+        dynamic_batch=(2, 64),
+        trace_batch_mode="batch_gt1",
+    )
+    candidate = next(
+        candidate
+        for candidate in enumerate_frontier_splits(plan)
+        if candidate.trainable_suffix and len(candidate.boundary_nodes) > 1
+    )
+    runtime = prepare_split(
+        model,
+        example_inputs=(x,),
+        split=SplitSpec(
+            boundary=candidate.split_id,
+            dynamic_batch=(2, 64),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+
+    targets = torch.randn(4, 3)
+    boundary = runtime.run_training_prefix(x)
+    _, boundary_grads = runtime.train_suffix(boundary, targets, loss_fn=F.mse_loss)
+
+    non_grad_labels = {
+        label for label, tensor in boundary.tensors.items() if not tensor.requires_grad
+    }
+    assert non_grad_labels
+    assert not non_grad_labels.intersection(boundary_grads)
+
+    runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
+
+    assert model.prefix.weight.grad is not None
+    assert model.suffix.weight.grad is not None
 
 
 def test_training_prefix_backpropagates_through_rng_sensitive_prefix() -> None:

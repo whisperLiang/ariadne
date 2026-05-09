@@ -47,14 +47,23 @@ class GeneratedInterceptionSegment(torch.nn.Module):
         exec(source, namespace)
         self._generated_forward = namespace["forward"].__get__(self, self.__class__)
         self.generated_source = source
+        self._batch_size_override: int | None = None
 
-    def forward(self, *inputs: Any) -> Any:
-        return self._generated_forward(*inputs)
+    def forward(self, *inputs: Any, batch_size: int | None = None) -> Any:
+        previous = self._batch_size_override
+        self._batch_size_override = batch_size
+        try:
+            return self._generated_forward(*inputs)
+        finally:
+            self._batch_size_override = previous
 
     def _new_env(self, inputs: tuple[Any, ...]) -> dict[str, Any]:
         if len(inputs) != len(self.input_names):
             raise ValueError(f"Expected {len(self.input_names)} inputs, got {len(inputs)}.")
         env = dict(zip(self.input_names, inputs, strict=True))
+        if self._batch_size_override is not None:
+            env["B"] = self._batch_size_override
+            return env
         for value in inputs:
             if isinstance(value, torch.Tensor) and value.ndim > 0:
                 env["B"] = int(value.shape[0])
@@ -91,11 +100,16 @@ class InterpretedInterceptionSegment(torch.nn.Module):
         super().__init__()
         self.generated = generated
 
-    def forward(self, *inputs: Any) -> Any:
-        env = self.generated._new_env(inputs)
-        for index in range(len(self.generated.ops)):
-            self.generated._run_op(index, env)
-        return self.generated._materialize_output(env)
+    def forward(self, *inputs: Any, batch_size: int | None = None) -> Any:
+        previous = self.generated._batch_size_override
+        self.generated._batch_size_override = batch_size
+        try:
+            env = self.generated._new_env(inputs)
+            for index in range(len(self.generated.ops)):
+                self.generated._run_op(index, env)
+            return self.generated._materialize_output(env)
+        finally:
+            self.generated._batch_size_override = previous
 
 
 def as_debug_interpreter(segment: torch.nn.Module) -> torch.nn.Module:

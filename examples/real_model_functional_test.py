@@ -49,24 +49,25 @@ def assert_split_train_equivalent(
     rtol: float = 1e-4,
     atol: float = 1e-5,
 ) -> None:
-    model.zero_grad(set_to_none=True)
-    direct_inputs = x.detach().clone().requires_grad_(True)
-    direct_loss = nested_tensor_loss(model(direct_inputs))
-    direct_loss.backward()
-    direct_grads = {
-        name: None if parameter.grad is None else parameter.grad.detach().clone()
-        for name, parameter in model.named_parameters()
-    }
+    with _deterministic_autograd_validation():
+        model.zero_grad(set_to_none=True)
+        direct_inputs = x.detach().clone().requires_grad_(True)
+        direct_loss = nested_tensor_loss(model(direct_inputs))
+        direct_loss.backward()
+        direct_grads = {
+            name: None if parameter.grad is None else parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
 
-    model.zero_grad(set_to_none=True)
-    split_inputs = x.detach().clone().requires_grad_(True)
-    boundary = runtime.run_training_prefix(split_inputs)
-    split_loss, boundary_grads = runtime.train_suffix(
-        boundary,
-        None,
-        loss_fn=lambda outputs, _targets: nested_tensor_loss(outputs),
-    )
-    runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
+        model.zero_grad(set_to_none=True)
+        split_inputs = x.detach().clone().requires_grad_(True)
+        boundary = runtime.run_training_prefix(split_inputs)
+        split_loss, boundary_grads = runtime.train_suffix(
+            boundary,
+            None,
+            loss_fn=lambda outputs, _targets: nested_tensor_loss(outputs),
+        )
+        runtime.backward_prefix(boundary, boundary_grads=boundary_grads)
 
     torch.testing.assert_close(split_loss, direct_loss.detach(), rtol=rtol, atol=atol)
     for name, parameter in model.named_parameters():
@@ -78,6 +79,26 @@ def assert_split_train_equivalent(
             raise AssertionError(f"Gradient presence mismatch for parameter {name!r}.")
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
     model.zero_grad(set_to_none=True)
+
+
+@contextlib.contextmanager
+def _deterministic_autograd_validation() -> Any:
+    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only_enabled = torch.is_deterministic_algorithms_warn_only_enabled()
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    cudnn_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_enabled,
+            warn_only=warn_only_enabled,
+        )
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+        torch.backends.cudnn.deterministic = cudnn_deterministic
 
 
 def run_model_smoke(

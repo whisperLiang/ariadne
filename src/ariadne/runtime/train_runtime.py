@@ -30,7 +30,11 @@ def train_suffix(
     grad_roots: dict[str, torch.Tensor] = {}
     for label in runtime.segments.boundary_order:
         tensor = boundary.tensors[label].detach()
-        if tensor.is_floating_point() or tensor.is_complex():
+        source_requires_grad = boundary.requires_grad.get(
+            label,
+            boundary.tensors[label].requires_grad,
+        )
+        if source_requires_grad and (tensor.is_floating_point() or tensor.is_complex()):
             grad_root = tensor.requires_grad_(True)
             grad_roots[label] = grad_root
             tensor = grad_root.clone()

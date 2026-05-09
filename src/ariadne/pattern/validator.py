@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from ariadne.pattern.shape_pattern import BoundaryTensorSpec
-from ariadne.pattern.split_spec import SplitSpec
+from ariadne.pattern.split_spec import SplitSpec, parse_boundary_percent
 
 
 def validate_split_spec(spec: SplitSpec) -> None:
-    if spec.boundary != "auto" and not spec.boundary.startswith("after:"):
-        raise ValueError("SplitSpec.boundary must be 'auto' or use the form 'after:<label>'.")
+    percent = parse_boundary_percent(spec.boundary)
+    if spec.boundary != "auto" and not spec.boundary.startswith("after:") and percent is None:
+        raise ValueError(
+            "SplitSpec.boundary must be 'auto', use the form 'after:<label>', "
+            "or use a percentage such as 'percent:50'."
+        )
     if spec.dynamic_batch is not None:
         low, high = spec.dynamic_batch
         if low < 1 or high < low:

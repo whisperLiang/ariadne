@@ -34,6 +34,20 @@ class BatchStructuralVariantNet(nn.Module):
         return self.out(self.act(self.proj(x)))
 
 
+class FoldedBatchBoundaryNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 6)
+        self.act = nn.ReLU()
+        self.out = nn.Linear(6, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x = self.act(self.proj(x))
+        x = x.reshape(-1, 3, 6).sum(dim=1)
+        return self.out(x)
+
+
 def test_replay_runtime_matches_direct_forward() -> None:
     torch.manual_seed(0)
     model = TinyNet().eval()
@@ -100,6 +114,27 @@ def test_replay_batch_one_boundary_stays_on_parent_runtime() -> None:
 
         torch.testing.assert_close(runtime.run_suffix(boundary), expected)
         torch.testing.assert_close(runtime.replay(inputs), expected)
+
+
+def test_replay_runtime_supports_folded_batch_boundary() -> None:
+    torch.manual_seed(0)
+    model = FoldedBatchBoundaryNet().eval()
+    runtime = prepare_split_replay(
+        model,
+        example_inputs=(torch.randn(2, 3, 4),),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 5),
+            trace_batch_mode="batch_gt1",
+        ),
+        mode="generated_eager",
+        validation="strict",
+    )
+    inputs = torch.randn(5, 3, 4)
+
+    with torch.no_grad():
+        expected = model(inputs)
+    torch.testing.assert_close(runtime.replay(inputs), expected)
 
 
 def test_replay_strict_validation_rejects_wrong_boundary_shape() -> None:

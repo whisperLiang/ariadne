@@ -171,7 +171,10 @@ class SplitReplayRuntime:
 
         self.validate_boundary(boundary)
         with torch.inference_mode():
-            return self.suffix_segment(*self._suffix_inputs(boundary))
+            return self.suffix_segment(
+                *self._suffix_inputs(boundary),
+                batch_size=boundary.batch_size,
+            )
 
     def replay(self, *inputs: Any) -> Any:
         batch_size = self._batch_size_from_inputs(inputs)

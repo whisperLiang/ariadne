@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from ariadne.pattern.split_spec import SplitSpec
-from ariadne.planner.frontier import enumerate_frontier_splits
+from ariadne.planner.frontier import SplitCandidate, enumerate_frontier_splits
 from ariadne.planner.selector import select_split
 from ariadne.trace.tracer import trace_model
 
@@ -18,6 +18,23 @@ class TinyNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layer2(self.act(self.layer1(x)))
+
+
+class DeepNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer1 = nn.Linear(5, 8)
+        self.layer2 = nn.Linear(8, 8)
+        self.layer3 = nn.Linear(8, 8)
+        self.layer4 = nn.Linear(8, 8)
+        self.layer5 = nn.Linear(8, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layer1(x).relu()
+        x = self.layer2(x).relu()
+        x = self.layer3(x).relu()
+        x = self.layer4(x).relu()
+        return self.layer5(x)
 
 
 class PoolNet(nn.Module):
@@ -100,6 +117,49 @@ def test_auto_split_returns_lowest_boundary_candidate() -> None:
     assert candidate.trainable_suffix
 
 
+def test_percent_split_selects_nearest_frontier_position() -> None:
+    plan = trace_model(
+        DeepNet(),
+        example_inputs=(torch.randn(4, 5),),
+        dynamic_batch=(2, 16),
+        trace_batch_mode="batch_gt1",
+    )
+    candidates = enumerate_frontier_splits(plan)
+    trainable_candidates = [candidate for candidate in candidates if candidate.trainable_suffix]
+
+    early = select_split(
+        plan,
+        split=SplitSpec(
+            boundary="percent:10",
+            dynamic_batch=(2, 16),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+    middle = select_split(
+        plan,
+        split=SplitSpec(
+            boundary="50%",
+            dynamic_batch=(2, 16),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+    late = select_split(
+        plan,
+        split=SplitSpec(
+            boundary="percent:90",
+            dynamic_batch=(2, 16),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+
+    assert early == _nearest_percent_candidate(candidates, trainable_candidates, 10)
+    assert middle == _nearest_percent_candidate(candidates, trainable_candidates, 50)
+    assert late == _nearest_percent_candidate(candidates, trainable_candidates, 90)
+
+
 def test_tracer_marks_dropout_rng_sensitive_and_trainable_split_allows_prefix_rng() -> None:
     plan = trace_model(
         DropoutNet().train(),
@@ -122,6 +182,21 @@ def test_tracer_marks_dropout_rng_sensitive_and_trainable_split_allows_prefix_rn
 
     assert candidate.boundary_after == "drop"
     assert any(plan.get_node(name).rng_sensitive for name in candidate.prefix_nodes)
+
+
+def _nearest_percent_candidate(
+    candidates: tuple[SplitCandidate, ...],
+    allowed_candidates: list[SplitCandidate],
+    percent: int,
+) -> SplitCandidate:
+    target_index = (percent / 100.0) * (len(candidates) - 1)
+    return min(
+        allowed_candidates,
+        key=lambda candidate: (
+            abs(candidates.index(candidate) - target_index),
+            candidates.index(candidate),
+        ),
+    )
 
 
 def test_frontier_planner_ignores_unconsumed_detach_nodes() -> None:

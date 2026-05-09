@@ -52,6 +52,31 @@ class BatchStructuralVariantNet(nn.Module):
         return self.out(self.act(self.proj(x)))
 
 
+class FoldedBatchBoundaryNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 6)
+        self.act = nn.ReLU()
+        self.out = nn.Linear(6, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+        x = self.act(self.proj(x))
+        x = x.reshape(-1, 3, 6).sum(dim=1)
+        return self.out(x)
+
+
+class AsStridedBatchNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.out = nn.Linear(4, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.mean(dim=(-1, -2), keepdim=True)
+        x.as_strided_((x.shape[0], 4, 1, 1), (4, 1, 4, 4))
+        return self.out(x.reshape(x.shape[0], 4))
+
+
 def test_dynamic_batch_reuses_trace_for_multiple_batch_sizes() -> None:
     model = ReshapeNet()
     runtime = prepare_split(
@@ -182,3 +207,48 @@ def test_batch_gt1_trace_supports_cross_batch_training() -> None:
         targets,
         loss_fn=F.mse_loss,
     )
+
+
+def test_batch_gt1_trace_supports_folded_batch_boundary_training() -> None:
+    torch.manual_seed(0)
+    direct_model = FoldedBatchBoundaryNet()
+    split_model = copy.deepcopy(direct_model)
+    runtime = prepare_split(
+        split_model,
+        example_inputs=(torch.randn(2, 3, 4, requires_grad=True),),
+        split=SplitSpec(
+            boundary="after:act",
+            dynamic_batch=(2, 5),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+
+    x_direct = torch.randn(5, 3, 4, requires_grad=True)
+    x_split = x_direct.detach().clone().requires_grad_(True)
+    targets = torch.randn(5, 2)
+    assert_gradient_equivalent(
+        direct_model,
+        runtime,
+        (x_direct,),
+        (x_split,),
+        targets,
+        loss_fn=F.mse_loss,
+    )
+
+
+def test_batch_gt1_trace_symbolizes_as_strided_batch_size() -> None:
+    model = AsStridedBatchNet()
+    runtime = prepare_split(
+        model,
+        example_inputs=(torch.randn(2, 4, 3, 3),),
+        split=SplitSpec(
+            boundary="after:node_0",
+            dynamic_batch=(2, 4),
+            trainable=True,
+            trace_batch_mode="batch_gt1",
+        ),
+    )
+
+    inputs = (torch.randn(3, 4, 3, 3),)
+    assert_forward_equivalent(model, runtime, inputs)

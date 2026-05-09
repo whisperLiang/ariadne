@@ -97,6 +97,7 @@ Useful demo commands:
 uv run python examples/split_inference_demo.py
 uv run python examples/split_training_demo.py
 uv run --extra integration --extra visualization python examples/visualize_trace_demo.py --model resnet18
+uv run --extra integration python examples/percent_split_real_model_test.py --models all
 ```
 
 Optional real-model smoke checks install the `integration` extra and may download
@@ -141,6 +142,11 @@ runtime = prepare_split(
 boundary = runtime.run_prefix(torch.randn(8, 5))
 output = runtime.run_suffix(boundary)
 ```
+
+`SplitSpec.boundary` also accepts percentage positions such as `"percent:50"`
+or `"50%"`. Ariadne maps the percentage onto the nearest valid traced frontier
+candidate, and if `trainable=True`, it chooses the nearest candidate whose
+suffix still has trainable parameters.
 
 ## Basic Split Training
 

@@ -22,6 +22,34 @@ def test_split_spec_accepts_after_boundary() -> None:
     validate_split_spec(spec)
 
 
+def test_split_spec_accepts_percent_boundary() -> None:
+    validate_split_spec(
+        SplitSpec(
+            boundary="percent:50",
+            dynamic_batch=(2, 16),
+            trace_batch_mode="batch_gt1",
+        )
+    )
+    validate_split_spec(
+        SplitSpec(
+            boundary="50%",
+            dynamic_batch=(2, 16),
+            trace_batch_mode="batch_gt1",
+        )
+    )
+
+
+def test_split_spec_rejects_out_of_range_percent_boundary() -> None:
+    with pytest.raises(ValueError, match="greater than 0 and less than 100"):
+        validate_split_spec(
+            SplitSpec(
+                boundary="percent:100",
+                dynamic_batch=(2, 16),
+                trace_batch_mode="batch_gt1",
+            )
+        )
+
+
 def test_split_spec_rejects_unknown_boundary_pattern() -> None:
     with pytest.raises(ValueError, match="after"):
         validate_split_spec(SplitSpec(boundary="layer3"))

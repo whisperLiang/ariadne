@@ -415,10 +415,12 @@ def _symbolic_shape_for_node(
     probe_batch: int | None,
 ) -> tuple[Any, ...]:
     traced_batch = shape_env.traced_batch_size
-    if traced_batch is None or not meta.shape or meta.shape[0] != traced_batch:
+    if traced_batch is None or not meta.shape:
         return meta.shape
     if name in recorder.input_node_names:
-        return (shape_env.batch_symbol, *meta.shape[1:])
+        if meta.shape[0] == traced_batch:
+            return (shape_env.batch_symbol, *meta.shape[1:])
+        return meta.shape
     if probe_batch is not None:
         probe_meta = probe_meta_by_node.get(name)
         if probe_meta is not None and len(probe_meta.shape) == len(meta.shape):
@@ -433,7 +435,7 @@ def _symbolic_shape_for_node(
                 for value, probe_value in zip(meta.shape, probe_meta.shape, strict=True)
             )
         return meta.shape
-    if traced_batch != 1:
+    if meta.shape[0] == traced_batch and traced_batch != 1:
         return (shape_env.batch_symbol, *meta.shape[1:])
     return meta.shape
 
@@ -1092,6 +1094,7 @@ def _is_shape_sensitive(target: str) -> bool:
             "reshape",
             "flatten",
             "unflatten",
+            "as_strided",
             "expand",
             "repeat",
             "zeros",

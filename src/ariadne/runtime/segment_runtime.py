@@ -162,7 +162,7 @@ class SplitRuntime:
 
         self.validate_boundary(boundary)
         suffix_inputs = self._suffix_inputs(boundary)
-        return self.suffix_segment(*suffix_inputs)
+        return self.suffix_segment(*suffix_inputs, batch_size=boundary.batch_size)
 
     def train_suffix(
         self,

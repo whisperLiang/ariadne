@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isclose
 from typing import Any
 
-from ariadne.pattern.split_spec import SplitSpec
+from ariadne.pattern.split_spec import SplitSpec, parse_boundary_percent
 from ariadne.planner.frontier import SplitCandidate, enumerate_frontier_splits
 from ariadne.trace.trace_plan import TraceNode, TracePlan
 
@@ -35,6 +36,14 @@ def select_split(
 
     if not isinstance(split, SplitSpec):
         raise TypeError("split must be a SplitSpec or 'auto'.")
+
+    percent = parse_boundary_percent(split.boundary)
+    if percent is not None:
+        return _select_percent_candidate(
+            candidates,
+            percent,
+            require_trainable_suffix=split.trainable,
+        )
 
     requested = split.boundary.removeprefix("after:")
     matches = [
@@ -66,6 +75,33 @@ def _select_auto(
     if minimize == "boundary_bytes":
         return min(filtered, key=lambda candidate: candidate.cost.boundary_bytes)
     return min(filtered, key=lambda candidate: candidate.cost.boundary_bytes)
+
+
+def _select_percent_candidate(
+    candidates: list[SplitCandidate],
+    percent: float,
+    *,
+    require_trainable_suffix: bool,
+) -> SplitCandidate:
+    ranked_candidates = list(enumerate(candidates))
+    if require_trainable_suffix:
+        ranked_candidates = [
+            (index, candidate)
+            for index, candidate in ranked_candidates
+            if candidate.trainable_suffix
+        ]
+    if not ranked_candidates:
+        raise ValueError("No split candidates satisfy the requested percentage constraints.")
+
+    target_index = (percent / 100.0) * (len(candidates) - 1)
+    return min(
+        ranked_candidates,
+        key=lambda item: (
+            abs(item[0] - target_index),
+            0 if isclose(float(item[0]), target_index) else 1,
+            item[0],
+        ),
+    )[1]
 
 
 def _matches_boundary(plan: TracePlan, candidate: SplitCandidate, requested: str) -> bool:
