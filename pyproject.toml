@@ -1,6 +1,6 @@
 [project]
 name = "ariadne-split"
-version = "0.1.0"
+version = "0.1.1"
 description = "Dynamic-batch split replay and split training runtime for PyTorch models."
 readme = "README.md"
 authors = [
