@@ -148,6 +148,19 @@ or `"50%"`. Ariadne maps the percentage onto the nearest valid traced frontier
 candidate, and if `trainable=True`, it chooses the nearest candidate whose
 suffix still has trainable parameters.
 
+Split frontiers are selected from verified operation-output groups. Ariadne
+keeps multi-output ATen/module calls together, carries all live values needed by
+the suffix as explicit boundary or passthrough values, and validates each
+candidate with replay before `auto` or percentage selection. When a user names a
+specific boundary, Ariadne still validates that boundary and raises a clear
+reason if it cannot be replayed safely.
+
+Boundary payloads always use the structured v2 protocol. Tensors are stored by
+label, while the boundary carries a serializable value tree for `None`,
+booleans, numbers, strings, bytes, `slice`, nested `list`/`tuple`/`dict`, and
+supported sequence values such as batch-polymorphic `split`, `chunk`, or
+`unbind` outputs.
+
 ## Basic Split Training
 
 ```python
@@ -263,9 +276,10 @@ symbolic batch dimension `B`. If an example trace uses batch size 4, tensors lik
   prepare a batch>1 structural variant when singleton and non-singleton aten
   paths differ.
 - `batch_gt1`: requires `example_inputs` batch size greater than 1 and a
-  `dynamic_batch` range that starts at 2 or greater. Ariadne stays in the
-  non-singleton regime, derives affine batch shapes such as `4*B`, and avoids
-  the extra singleton structural variant used by `batch_1`.
+  `dynamic_batch` range that contains the runtime batch sizes you want to
+  allow. Ariadne traces in the non-singleton regime, derives affine batch shapes
+  such as `4*B`, and validates any singleton runtime batch in the range as an
+  explicit safe-frontier condition.
 
 For real YOLO and RF-DETR smoke tests, Ariadne uses `batch_gt1` mode and verifies
 cross-batch split replay plus split training on batch sizes 2 and 3.
@@ -274,6 +288,27 @@ At runtime, Ariadne materializes `B` from the actual input batch size, validates
 that it is inside `SplitSpec.dynamic_batch`, and checks that non-batch dimensions
 match the prepared boundary schema. The concrete batch size is intentionally not
 part of `RuntimeCacheKey`.
+
+Dynamic batch support covers tensor shapes, affine batch-derived dimensions, and
+batch-derived Python integer arguments. It also supports whole-sequence
+consumption of batch-polymorphic `split`, `chunk`, and `unbind` results. When a
+validated split frontier must transport such a sequence, Ariadne uses
+BoundaryPayload's structured value tree so the suffix can rebuild the Python
+structure before replay or split training. If dynamic Python control flow
+changes the traced op count,
+indexes or reorders an unsupported dynamic sequence pattern, or captures an
+unserializable external object, Ariadne marks that candidate unsafe. `auto` and
+percentage splits skip unsafe candidates; an explicit boundary reports the
+rejection reason during preparation instead of failing later inside replay.
+
+For smoke checks outside the test suite, use `validate_dynamic_batches()` to run
+prepared prefix/suffix replay across selected batch sizes:
+
+```python
+from ariadne import validate_dynamic_batches
+
+validate_dynamic_batches(runtime, example_inputs=(x,), batch_sizes=(1, 4, 20))
+```
 
 ## Execution Modes
 
@@ -378,8 +413,12 @@ batch size, split id, execution mode, and optional CUDA peak memory.
 - The default tracer uses `TorchDispatchMode` runtime interception and records the
   observed forward path.
 - Alias, mutation, RNG, FLOP, and memory metadata are intentionally lightweight.
-- Segment generation currently supports tensor boundaries from prepared observed
-  paths, including a batch>1 structural variant when batch=1 tracing needs it.
+- Segment generation supports verified structured boundaries from prepared
+  observed paths, including a batch>1 structural variant when batch=1 tracing
+  needs it.
+- Whole dynamic `split`/`chunk`/`unbind` sequences can replay inside a segment
+  or cross a split boundary through the structured payload. Unsupported
+  element-wise dynamic sequence use is rejected at preparation time.
 - Dynamic non-batch dimensions are reserved for future SplitSpec extensions.
 - Shape expressions cover direct and affine batch-derived dimensions; more
   complex non-affine shape arithmetic is still limited.

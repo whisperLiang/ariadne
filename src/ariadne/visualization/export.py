@@ -80,6 +80,7 @@ def export_split_candidates_table(plan: TracePlan) -> list[dict[str, Any]]:
                 "suffix_node_count": candidate.cost.suffix_node_count,
                 "trainable_suffix": candidate.trainable_suffix,
                 "passthrough_inputs": candidate.passthrough_inputs,
+                "rejection_reason": candidate.rejection_reason,
             }
         )
     return rows

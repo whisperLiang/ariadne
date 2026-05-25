@@ -7,8 +7,20 @@ from typing import Any
 
 import torch
 
+from ariadne.pattern.boundary_value import (
+    BoundaryValueSpec,
+    materialize_boundary_value,
+    register_boundary_serializer,
+    validate_boundary_value,
+)
 from ariadne.pattern.shape_pattern import BoundaryTensorSpec
 from ariadne.trace.tensor_meta import ShapeEnv
+
+__all__ = [
+    "BoundaryPayload",
+    "register_boundary_serializer",
+    "validate_boundary_payload",
+]
 
 
 @dataclass(frozen=True)
@@ -23,6 +35,9 @@ class BoundaryPayload:
     passthrough_inputs: dict[str, Any] = field(default_factory=dict)
     supports_prefix_backward: bool = False
     prefix_backward_owner_id: str | None = field(default=None, repr=False)
+    protocol_version: int = 2
+    values: tuple[Any, ...] = ()
+    value_schema: tuple[BoundaryValueSpec, ...] = ()
 
 
 def validate_boundary_payload(
@@ -32,6 +47,7 @@ def validate_boundary_payload(
     graph_signature: str,
     schema: dict[str, BoundaryTensorSpec],
     shape_env: ShapeEnv,
+    value_schema: tuple[BoundaryValueSpec, ...] | None = None,
 ) -> None:
     if payload.split_id != split_id:
         raise ValueError(f"Boundary split_id {payload.split_id!r} does not match {split_id!r}.")
@@ -40,12 +56,29 @@ def validate_boundary_payload(
             f"Boundary graph_signature {payload.graph_signature!r} does not match "
             f"{graph_signature!r}."
         )
+    if payload.schema != schema:
+        raise ValueError("BoundaryPayload schema does not match runtime schema.")
     shape_env.validate_batch(payload.batch_size)
 
-    missing = [label for label in schema if label not in payload.tensors]
-    if missing:
-        raise ValueError(f"Boundary payload is missing labels: {', '.join(missing)}.")
-
-    for label, tensor_spec in schema.items():
-        tensor = payload.tensors[label]
-        tensor_spec.validate_tensor(tensor, shape_env, payload.batch_size)
+    if payload.protocol_version != 2:
+        raise ValueError("BoundaryPayload only supports protocol_version=2.")
+    expected_value_schema = payload.value_schema if value_schema is None else value_schema
+    if value_schema is not None and payload.value_schema != expected_value_schema:
+        raise ValueError("BoundaryPayload v2 value_schema does not match runtime schema.")
+    if len(payload.values) != len(expected_value_schema):
+        raise ValueError(
+            f"BoundaryPayload has {len(payload.values)} value(s); "
+            f"expected {len(expected_value_schema)} schema item(s)."
+        )
+    for value, value_spec in zip(payload.values, expected_value_schema, strict=True):
+        materialized = materialize_boundary_value(
+            value,
+            value_spec,
+            payload.tensors,
+        )
+        validate_boundary_value(
+            materialized,
+            value_spec,
+            shape_env=shape_env,
+            batch_size=payload.batch_size,
+        )

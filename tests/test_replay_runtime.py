@@ -152,7 +152,11 @@ def test_replay_strict_validation_rejects_wrong_boundary_shape() -> None:
     )
 
     boundary = runtime.run_prefix(torch.randn(4, 5))
-    bad_boundary = replace(boundary, values=(torch.randn(4, 9),))
+    label = runtime.boundary_order[0]
+    bad_boundary = replace(
+        boundary,
+        tensors={**boundary.tensors, label: torch.randn(4, 9)},
+    )
 
     try:
         runtime.run_suffix(bad_boundary)
@@ -209,5 +213,6 @@ def test_replay_compiled_boundary_is_materialized_by_default() -> None:
 
     assert isinstance(raw_values, tuple)
     assert isinstance(raw_values[0], torch.Tensor)
-    assert boundary.values[0] is not raw_values[0]
-    torch.testing.assert_close(boundary.values[0], raw_values[0])
+    label = runtime.boundary_order[0]
+    assert boundary.tensors[label] is not raw_values[0]
+    torch.testing.assert_close(boundary.tensors[label], raw_values[0])

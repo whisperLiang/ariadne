@@ -11,10 +11,15 @@ import torch
 from ariadne.codegen.interception_segments import as_debug_interpreter
 from ariadne.codegen.segment_builder import ReplaySegmentBundle
 from ariadne.compiler.torch_compile import replay_compile_options
+from ariadne.pattern.boundary_value import (
+    BoundaryValueSpec,
+    encode_boundary_value,
+    materialize_boundary_value,
+)
 from ariadne.pattern.split_spec import SplitSpec
 from ariadne.planner.frontier import SplitCandidate
+from ariadne.runtime.batching import batch_size_from_inputs, validate_inputs
 from ariadne.runtime.boundary import BoundaryPayload, validate_boundary_payload
-from ariadne.trace.tensor_meta import ShapeExpr
 from ariadne.trace.trace_plan import TracePlan
 
 ReplayExecutionMode = Literal["debug_interpreter", "generated_eager", "compiled"]
@@ -34,6 +39,9 @@ class ReplayBoundary:
     batch_size: int
     values: tuple[Any, ...]
     passthrough_values: tuple[Any, ...] = ()
+    protocol_version: int = 2
+    value_schema: tuple[BoundaryValueSpec, ...] = ()
+    tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     owner_id: str | None = field(default=None, repr=False)
 
 
@@ -153,12 +161,22 @@ class SplitReplayRuntime:
             values = _as_tuple(self.prefix_segment(*inputs))
             if self._should_materialize_boundary():
                 values = _materialize_boundary_values(values)
+            value_schema = self._boundary_value_schema()
+            encoded_values = []
+            tensors: dict[str, torch.Tensor] = {}
+            for value, spec in zip(values, value_schema, strict=True):
+                encoded, value_tensors = encode_boundary_value(value, spec)
+                encoded_values.append(encoded)
+                tensors.update(value_tensors)
+            values = tuple(encoded_values)
         return ReplayBoundary(
             split_id=self.split_id,
             graph_signature=self.graph_signature,
             batch_size=batch_size,
             values=values,
             passthrough_values=self._passthrough_values(inputs),
+            value_schema=value_schema,
+            tensors=tensors,
             owner_id=self.owner_id,
         )
 
@@ -189,12 +207,16 @@ class SplitReplayRuntime:
         if self.validation == "fast":
             if boundary.owner_id != self.owner_id:
                 raise ValueError("ReplayBoundary was produced by a different SplitReplayRuntime.")
+            if boundary.protocol_version != 2:
+                raise ValueError("ReplayBoundary only supports protocol_version=2.")
             self.trace_plan.shape_env.validate_batch(boundary.batch_size)
             if len(boundary.values) != len(self.segments.boundary_order):
                 raise ValueError(
                     f"ReplayBoundary has {len(boundary.values)} values; "
                     f"expected {len(self.segments.boundary_order)}."
                 )
+            if boundary.value_schema != self._boundary_value_schema():
+                raise ValueError("ReplayBoundary value_schema does not match runtime schema.")
             if len(boundary.passthrough_values) != len(self.segments.passthrough_order):
                 raise ValueError(
                     f"ReplayBoundary has {len(boundary.passthrough_values)} passthrough "
@@ -208,6 +230,7 @@ class SplitReplayRuntime:
             graph_signature=self.graph_signature,
             schema=self.candidate.boundary_schema,
             shape_env=self.trace_plan.shape_env,
+            value_schema=self._boundary_value_schema(),
         )
 
     def with_validation(self, validation: ReplayValidationMode) -> SplitReplayRuntime:
@@ -239,7 +262,12 @@ class SplitReplayRuntime:
         _sync_cuda()
 
     def _suffix_inputs(self, boundary: ReplayBoundary) -> tuple[Any, ...]:
-        return (*boundary.values, *boundary.passthrough_values)
+        value_schema = self._boundary_value_schema()
+        values = tuple(
+            materialize_boundary_value(value, spec, boundary.tensors)
+            for value, spec in zip(boundary.values, value_schema, strict=True)
+        )
+        return (*values, *boundary.passthrough_values)
 
     def _should_materialize_boundary(self) -> bool:
         return (
@@ -249,6 +277,12 @@ class SplitReplayRuntime:
 
     def _passthrough_values(self, inputs: tuple[Any, ...]) -> tuple[Any, ...]:
         return tuple(inputs[index] for index in self._passthrough_indices)
+
+    def _boundary_value_schema(self) -> tuple[BoundaryValueSpec, ...]:
+        return tuple(
+            self.candidate.boundary_value_schema[label]
+            for label in self.segments.boundary_order
+        )
 
     def _to_boundary_payload(self, boundary: ReplayBoundary) -> BoundaryPayload:
         if boundary.split_id != self.split_id:
@@ -260,11 +294,7 @@ class SplitReplayRuntime:
                 f"Boundary graph_signature {boundary.graph_signature!r} does not match "
                 f"{self.graph_signature!r}."
             )
-        tensors = {
-            label: value
-            for label, value in zip(self.segments.boundary_order, boundary.values, strict=True)
-            if isinstance(value, torch.Tensor)
-        }
+        tensors = dict(boundary.tensors)
         passthrough_inputs = dict(
             zip(self.segments.passthrough_order, boundary.passthrough_values, strict=True)
         )
@@ -276,6 +306,8 @@ class SplitReplayRuntime:
             schema=self.candidate.boundary_schema,
             requires_grad={label: tensor.requires_grad for label, tensor in tensors.items()},
             passthrough_inputs=passthrough_inputs,
+            values=boundary.values,
+            value_schema=boundary.value_schema,
         )
 
     def _validate_inputs_for_mode(self, inputs: tuple[Any, ...], *, batch_size: int) -> None:
@@ -285,43 +317,10 @@ class SplitReplayRuntime:
             self.trace_plan.shape_env.validate_batch(batch_size)
 
     def _validate_inputs(self, inputs: tuple[Any, ...]) -> None:
-        batch_size = self._batch_size_from_inputs(inputs)
-        self.trace_plan.shape_env.validate_batch(batch_size)
-        for index, meta in enumerate(self.trace_plan.input_metas):
-            if meta is None or index >= len(inputs) or not isinstance(inputs[index], torch.Tensor):
-                continue
-            tensor = inputs[index]
-            if tensor.ndim != len(meta.symbolic_shape):
-                raise ValueError(
-                    f"Input {index} rank {tensor.ndim} does not match traced rank "
-                    f"{len(meta.symbolic_shape)}."
-                )
-            for dim_index, (actual, expected) in enumerate(
-                zip(tensor.shape, meta.symbolic_shape, strict=True)
-            ):
-                if expected == self.trace_plan.shape_env.batch_symbol:
-                    continue
-                if isinstance(expected, ShapeExpr):
-                    expected_int = expected.materialize(
-                        {self.trace_plan.shape_env.batch_symbol: batch_size}
-                    )
-                    if int(actual) != expected_int:
-                        raise ValueError(
-                            f"Input {index} dimension {dim_index} is {int(actual)}; "
-                            f"expected {expected_int} from {expected}."
-                        )
-                    continue
-                if isinstance(expected, int) and int(actual) != expected:
-                    raise ValueError(
-                        f"Input {index} dimension {dim_index} is {int(actual)}; "
-                        f"expected {expected}."
-                    )
+        validate_inputs(self.trace_plan, inputs)
 
     def _batch_size_from_inputs(self, inputs: tuple[Any, ...]) -> int:
-        for value in inputs:
-            if isinstance(value, torch.Tensor) and value.ndim > 0:
-                return int(value.shape[0])
-        raise ValueError("Ariadne requires at least one batched tensor input.")
+        return batch_size_from_inputs(inputs)
 
     def _variant_for_batch(self, batch_size: int) -> SplitReplayRuntime | None:
         for variant in self.variants:

@@ -28,7 +28,7 @@ from ariadne.trace.tensor_meta import (
     param_ref_from_parameter,
     tensor_meta_from_tensor,
 )
-from ariadne.trace.trace_plan import TraceNode, TracePlan, compute_graph_signature
+from ariadne.trace.trace_plan import TraceNode, TracePlan
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,28 @@ class BatchDimArg:
 
 
 @dataclass(frozen=True)
+class SequenceArg:
+    name: str
+    container_type: str
+
+
+@dataclass(frozen=True)
+class SequenceElementArg:
+    sequence_name: str
+    index: int
+
+
+@dataclass(frozen=True)
+class SequenceOutputTemplate:
+    name: str
+    container_type: str
+    length_expr: int | BatchDimArg | ShapeExpr
+    element_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class CapturedOp:
+    op_index: int
     name: str
     target: str
     callable_ref: Any
@@ -77,6 +98,8 @@ class CapturedOp:
     module_path: str | None
     rng_sensitive: bool
     mutating: bool
+    dynamic_output_structure: bool = False
+    dynamic_structure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +129,11 @@ class _Recorder(TorchDispatchMode):
         self.shape_env = shape_env
         self.tensor_to_node: dict[int, tuple[ReferenceType[torch.Tensor], str]] = {}
         self.tensor_meta_by_node: dict[str, TensorMeta] = {}
+        self.sequence_containers: dict[int, tuple[Any, SequenceOutputTemplate]] = {}
+        self.sequence_elements: dict[
+            int,
+            tuple[ReferenceType[torch.Tensor], SequenceElementArg],
+        ] = {}
         self.ops: list[CapturedOp] = []
         self.module_stack: list[str] = []
         self.parameter_names_by_id = {
@@ -136,16 +164,21 @@ class _Recorder(TorchDispatchMode):
     ) -> Any:
         kwargs = kwargs or {}
         target = _target_name(func)
-        args_template = self._template(args)
+        args_template = self._template(args, allow_rebuilt_sequence=False)
         kwargs_template = self._template(kwargs)
         parents = tuple(dict.fromkeys(_node_refs(args_template) + _node_refs(kwargs_template)))
         result = func(*args, **kwargs)
-        output_template, output_names, tensor_metas = self._register_outputs(result)
+        output_template, output_names, tensor_metas = self._register_outputs(
+            result,
+            target=target,
+        )
 
         if output_names:
             op_name = output_names[0]
+            op_index = len(self.ops)
             self.ops.append(
                 CapturedOp(
+                    op_index=op_index,
                     name=op_name,
                     target=target,
                     callable_ref=func,
@@ -187,9 +220,33 @@ class _Recorder(TorchDispatchMode):
             visit(value, f"input_{index}")
         return tuple(names)
 
-    def _register_outputs(self, result: Any) -> tuple[Any, list[str], dict[str, TensorMeta]]:
+    def _register_outputs(
+        self,
+        result: Any,
+        *,
+        target: str,
+    ) -> tuple[Any, list[str], dict[str, TensorMeta]]:
         output_names: list[str] = []
         tensor_metas: dict[str, TensorMeta] = {}
+
+        if _is_sequence_producing_target(target) and _is_tensor_sequence(result):
+            sequence_name = f"node_{len(self.ops)}"
+            element_names: list[str] = []
+            for index, item in enumerate(result):
+                element_name = f"{sequence_name}_{index}"
+                element_names.append(element_name)
+                self._remember_tensor_node(item, element_name)
+                meta = tensor_meta_from_tensor(item, self.meta_shape_env)
+                self.tensor_meta_by_node[element_name] = meta
+                tensor_metas[element_name] = meta
+            template = SequenceOutputTemplate(
+                name=sequence_name,
+                container_type=_container_type_name(result),
+                length_expr=len(result),
+                element_names=tuple(element_names),
+            )
+            self._remember_sequence(result, template)
+            return template, [sequence_name, *element_names], tensor_metas
 
         def visit(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
@@ -212,11 +269,14 @@ class _Recorder(TorchDispatchMode):
 
         return visit(result), output_names, tensor_metas
 
-    def _template(self, value: Any) -> Any:
+    def _template(self, value: Any, *, allow_rebuilt_sequence: bool = True) -> Any:
         if isinstance(value, torch.nn.Parameter) and id(value) in self.parameter_names_by_id:
             return ParamArg(self.parameter_names_by_id[id(value)])
         if isinstance(value, torch.Tensor):
             tensor_id = id(value)
+            sequence_element = self._sequence_element_for_tensor(value)
+            if sequence_element is not None:
+                return sequence_element
             node_name = self._node_for_tensor(value)
             if node_name is not None:
                 return NodeArg(node_name)
@@ -233,9 +293,27 @@ class _Recorder(TorchDispatchMode):
                 "16 elements. Register it as an input, parameter, or buffer."
             )
         if isinstance(value, tuple):
-            return tuple(self._template(item) for item in value)
+            sequence_arg = self._sequence_arg_for_container(value)
+            if sequence_arg is not None:
+                return sequence_arg
+            templated_tuple = tuple(self._template(item) for item in value)
+            if allow_rebuilt_sequence:
+                return (
+                    self._sequence_arg_for_rebuilt_container(templated_tuple, "tuple")
+                    or templated_tuple
+                )
+            return templated_tuple
         if isinstance(value, list):
-            return [self._template(item) for item in value]
+            sequence_arg = self._sequence_arg_for_container(value)
+            if sequence_arg is not None:
+                return sequence_arg
+            templated_list = [self._template(item) for item in value]
+            if allow_rebuilt_sequence:
+                return (
+                    self._sequence_arg_for_rebuilt_container(templated_list, "list")
+                    or templated_list
+                )
+            return templated_list
         if isinstance(value, dict):
             return {key: self._template(item) for key, item in value.items()}
         if isinstance(value, slice):
@@ -246,8 +324,59 @@ class _Recorder(TorchDispatchMode):
             )
         return value
 
+    def _remember_sequence(self, value: Any, template: SequenceOutputTemplate) -> None:
+        self.sequence_containers[id(value)] = (value, template)
+        for index, item in enumerate(value):
+            if isinstance(item, torch.Tensor):
+                element = SequenceElementArg(template.name, index)
+                self.sequence_elements[id(item)] = (ref(item), element)
+
+    def _sequence_arg_for_container(self, value: Any) -> SequenceArg | None:
+        entry = self.sequence_containers.get(id(value))
+        if entry is None:
+            return None
+        container, template = entry
+        if container is not value:
+            return None
+        return SequenceArg(template.name, _container_type_name(value))
+
+    def _sequence_arg_for_rebuilt_container(
+        self,
+        value: tuple[Any, ...] | list[Any],
+        container_type: str,
+    ) -> SequenceArg | None:
+        if not value or not all(isinstance(item, SequenceElementArg) for item in value):
+            return None
+        elements = [item for item in value if isinstance(item, SequenceElementArg)]
+        sequence_name = elements[0].sequence_name
+        if any(element.sequence_name != sequence_name for element in elements):
+            return None
+        if [element.index for element in elements] != list(range(len(elements))):
+            return None
+        sequence_template = next(
+            (
+                template
+                for _container, template in self.sequence_containers.values()
+                if template.name == sequence_name
+            ),
+            None,
+        )
+        if sequence_template is None or sequence_template.length_expr != len(elements):
+            return None
+        return SequenceArg(sequence_name, container_type)
+
     def _remember_tensor_node(self, tensor: torch.Tensor, node_name: str) -> None:
         self.tensor_to_node[id(tensor)] = (ref(tensor), node_name)
+
+    def _sequence_element_for_tensor(self, tensor: torch.Tensor) -> SequenceElementArg | None:
+        entry = self.sequence_elements.get(id(tensor))
+        if entry is None:
+            return None
+        tensor_ref, element = entry
+        if tensor_ref() is tensor:
+            return element
+        del self.sequence_elements[id(tensor)]
+        return None
 
     def _node_for_tensor(self, tensor: torch.Tensor) -> str | None:
         tensor_id = id(tensor)
@@ -335,13 +464,17 @@ def trace_model_interception(
         shape_env=shape_env,
         probe_batch=probe_batch,
     )
-    ops = _canonicalize_ops(
+    ops, sequence_templates, dynamic_sequences = _canonicalize_ops(
         recorder,
         probe_ops_by_index=probe_ops_by_index,
         shape_env=shape_env,
         probe_batch=probe_batch,
     )
-    output_template = recorder._template(recorder.output)
+    output_template = _canonicalize_sequence_refs(
+        recorder._template(recorder.output),
+        sequence_templates=sequence_templates,
+        dynamic_sequences=dynamic_sequences,
+    )
     nodes = _build_trace_nodes(recorder, ops, output_template)
     artifact = InterceptionTraceArtifact(
         ops=ops,
@@ -357,7 +490,7 @@ def trace_model_interception(
         if name in recorder.tensor_meta_by_node
     )
     return TracePlan(
-        graph_signature=_interception_signature(nodes, shape_env),
+        graph_signature=_interception_signature(nodes, shape_env, ops=ops),
         nodes=nodes,
         input_metas=tuple(recorder.tensor_meta_by_node[name] for name in recorder.input_node_names),
         output_metas=output_metas,
@@ -446,58 +579,207 @@ def _canonicalize_ops(
     probe_ops_by_index: tuple[CapturedOp | None, ...],
     shape_env: ShapeEnv,
     probe_batch: int | None,
-) -> tuple[CapturedOp, ...]:
+) -> tuple[
+    tuple[CapturedOp, ...],
+    dict[str, SequenceOutputTemplate],
+    dict[str, SequenceOutputTemplate],
+]:
     ops: list[CapturedOp] = []
+    sequence_templates: dict[str, SequenceOutputTemplate] = {}
+    dynamic_sequences: dict[str, SequenceOutputTemplate] = {}
     for index, op in enumerate(recorder.ops):
         args_template = op.args_template
         kwargs_template = op.kwargs_template
-        if _is_shape_sensitive(op.target):
-            probe_op = probe_ops_by_index[index]
-            if probe_op is not None and probe_batch is not None:
-                arg_exprs = _batch_exprs(
-                    op.args_template,
-                    probe_op.args_template,
-                    traced_batch=shape_env.traced_batch_size,
-                    probe_batch=probe_batch,
-                    symbol=shape_env.batch_symbol,
-                )
-                kwarg_exprs = _batch_exprs(
-                    op.kwargs_template,
-                    probe_op.kwargs_template,
-                    traced_batch=shape_env.traced_batch_size,
-                    probe_batch=probe_batch,
-                    symbol=shape_env.batch_symbol,
-                )
-                args_template = _replace_batch_exprs(
-                    op.args_template,
-                    arg_exprs,
-                )
-                kwargs_template = _replace_batch_exprs(
-                    op.kwargs_template,
-                    kwarg_exprs,
-                )
-            elif shape_env.traced_batch_size is not None and shape_env.traced_batch_size != 1:
-                args_template = _replace_matching_batch_constants(
-                    op.args_template,
-                    shape_env.traced_batch_size,
-                    shape_env.batch_symbol,
-                )
-                kwargs_template = _replace_matching_batch_constants(
-                    op.kwargs_template,
-                    shape_env.traced_batch_size,
-                    shape_env.batch_symbol,
-                )
+        dynamic_output_structure = False
+        dynamic_structure_reason = None
+        output_template = op.output_template
+        probe_op = probe_ops_by_index[index]
+        if probe_op is not None and probe_batch is not None:
+            arg_exprs = _batch_exprs(
+                op.args_template,
+                probe_op.args_template,
+                traced_batch=shape_env.traced_batch_size,
+                probe_batch=probe_batch,
+                symbol=shape_env.batch_symbol,
+            )
+            kwarg_exprs = _batch_exprs(
+                op.kwargs_template,
+                probe_op.kwargs_template,
+                traced_batch=shape_env.traced_batch_size,
+                probe_batch=probe_batch,
+                symbol=shape_env.batch_symbol,
+            )
+            args_template = _replace_batch_exprs(op.args_template, arg_exprs)
+            kwargs_template = _replace_batch_exprs(op.kwargs_template, kwarg_exprs)
+        args_template = _canonicalize_sequence_refs(
+            args_template,
+            sequence_templates=sequence_templates,
+            dynamic_sequences=dynamic_sequences,
+        )
+        kwargs_template = _canonicalize_sequence_refs(
+            kwargs_template,
+            sequence_templates=sequence_templates,
+            dynamic_sequences=dynamic_sequences,
+        )
+
+        if isinstance(op.output_template, SequenceOutputTemplate):
+            output_template, dynamic_structure_reason = _canonicalize_sequence_output(
+                op.output_template,
+                probe_op.output_template if probe_op is not None else None,
+                traced_batch=shape_env.traced_batch_size,
+                probe_batch=probe_batch,
+                symbol=shape_env.batch_symbol,
+            )
+            sequence_templates[op.output_template.name] = op.output_template
+            if dynamic_structure_reason is None and isinstance(
+                output_template,
+                SequenceOutputTemplate,
+            ):
+                dynamic_sequences[output_template.name] = output_template
+        elif probe_op is not None and not _compatible_container_structure(
+            op.output_template,
+            probe_op.output_template,
+        ):
+            dynamic_output_structure = True
+            dynamic_structure_reason = (
+                "batch-dependent Python container structure is not representable "
+                "as a supported dynamic sequence"
+            )
+        if dynamic_structure_reason is not None:
+            dynamic_output_structure = True
         ops.append(
             replace(
                 op,
                 args_template=args_template,
                 kwargs_template=kwargs_template,
+                parents=tuple(
+                    dict.fromkeys(_node_refs(args_template) + _node_refs(kwargs_template))
+                ),
+                output_template=output_template,
                 tensor_metas={
                     name: recorder.tensor_meta_by_node[name] for name in op.output_names
+                    if name in recorder.tensor_meta_by_node
                 },
+                dynamic_output_structure=dynamic_output_structure,
+                dynamic_structure_reason=dynamic_structure_reason,
             )
         )
-    return tuple(ops)
+    return tuple(ops), sequence_templates, dynamic_sequences
+
+
+def _canonicalize_sequence_refs(
+    value: Any,
+    *,
+    sequence_templates: dict[str, SequenceOutputTemplate],
+    dynamic_sequences: dict[str, SequenceOutputTemplate],
+) -> Any:
+    if isinstance(value, SequenceArg):
+        if value.name in dynamic_sequences:
+            return value
+        template = sequence_templates.get(value.name)
+        return _fixed_sequence_template(template, value.container_type) if template else value
+    if isinstance(value, SequenceElementArg):
+        if value.sequence_name in dynamic_sequences:
+            return value
+        template = sequence_templates.get(value.sequence_name)
+        if template is None or value.index >= len(template.element_names):
+            return value
+        return NodeArg(template.element_names[value.index])
+    if isinstance(value, tuple):
+        return tuple(
+            _canonicalize_sequence_refs(
+                item,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            )
+            for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _canonicalize_sequence_refs(
+                item,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _canonicalize_sequence_refs(
+                item,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, slice):
+        return slice(
+            _canonicalize_sequence_refs(
+                value.start,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            ),
+            _canonicalize_sequence_refs(
+                value.stop,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            ),
+            _canonicalize_sequence_refs(
+                value.step,
+                sequence_templates=sequence_templates,
+                dynamic_sequences=dynamic_sequences,
+            ),
+        )
+    return value
+
+
+def _canonicalize_sequence_output(
+    template: SequenceOutputTemplate,
+    probe_template: Any,
+    *,
+    traced_batch: int | None,
+    probe_batch: int | None,
+    symbol: str,
+) -> tuple[Any, str | None]:
+    if not isinstance(probe_template, SequenceOutputTemplate) or probe_batch is None:
+        return _fixed_sequence_template(template), None
+    if template.container_type != probe_template.container_type:
+        return template, "dynamic sequence container type changed between trace and probe"
+    trace_length = _sequence_length_value(template.length_expr)
+    probe_length = _sequence_length_value(probe_template.length_expr)
+    if trace_length == probe_length:
+        return _fixed_sequence_template(template), None
+    if traced_batch is None:
+        return template, "dynamic sequence length changed without a known batch symbol"
+    expression = _template_expression_for_values(
+        trace_length,
+        probe_length,
+        traced_batch=traced_batch,
+        probe_batch=probe_batch,
+        symbol=symbol,
+    )
+    if expression is None:
+        return (
+            template,
+            "dynamic sequence length changed but did not fit an affine batch expression",
+        )
+    return replace(template, length_expr=expression), None
+
+
+def _fixed_sequence_template(
+    template: SequenceOutputTemplate,
+    container_type: str | None = None,
+) -> tuple[NodeArg, ...] | list[NodeArg]:
+    values = [NodeArg(name) for name in template.element_names]
+    if (container_type or template.container_type) == "tuple":
+        return tuple(values)
+    return values
+
+
+def _sequence_length_value(value: int | BatchDimArg | ShapeExpr) -> int:
+    if isinstance(value, int):
+        return value
+    raise TypeError("Sequence length must be concrete before canonicalization.")
 
 
 def _build_trace_nodes(
@@ -519,7 +801,8 @@ def _build_trace_nodes(
             )
         )
     for op in ops:
-        for output_name in op.output_names:
+        alias_metadata = _op_alias_metadata(op)
+        for output_index, output_name in enumerate(op.output_names):
             nodes.append(
                 TraceNode(
                     name=output_name,
@@ -528,10 +811,13 @@ def _build_trace_nodes(
                     args_template=op.args_template,
                     kwargs_template=op.kwargs_template,
                     parents=op.parents,
-                    tensor_meta=op.tensor_metas[output_name],
+                    tensor_meta=op.tensor_metas.get(output_name),
                     param_refs=op.param_refs,
                     buffer_refs=op.buffer_refs,
                     module_path=op.module_path,
+                    op_index=op.op_index,
+                    output_index=output_index,
+                    alias_metadata=alias_metadata,
                     mutation_metadata={"possibly_mutating": True} if op.mutating else None,
                     rng_sensitive=op.rng_sensitive,
                 )
@@ -547,6 +833,36 @@ def _build_trace_nodes(
         )
     )
     return tuple(nodes)
+
+
+def _op_alias_metadata(op: CapturedOp) -> dict[str, Any] | None:
+    metadata: dict[str, Any] = {}
+    if op.dynamic_output_structure:
+        metadata["dynamic_output_structure"] = True
+        metadata["dynamic_structure_reason"] = op.dynamic_structure_reason
+    if _contains_sequence_element_arg(
+        op.args_template,
+    ) or _contains_sequence_element_arg(op.kwargs_template):
+        metadata["unsupported_dynamic_sequence_use"] = True
+        metadata["dynamic_structure_reason"] = (
+            "dynamic sequence is indexed element-wise after trace"
+        )
+    return metadata or None
+
+
+def _contains_sequence_element_arg(value: Any) -> bool:
+    if isinstance(value, SequenceElementArg):
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_contains_sequence_element_arg(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_sequence_element_arg(item) for item in value.values())
+    if isinstance(value, slice):
+        return any(
+            _contains_sequence_element_arg(item)
+            for item in (value.start, value.stop, value.step)
+        )
+    return False
 
 
 def _install_module_stack_hooks(
@@ -612,12 +928,29 @@ def _probe_meta_by_node(
         if probe_meta is not None:
             metas[name] = probe_meta
     for op, probe_op in zip(recorder.ops, probe_ops_by_index, strict=True):
-        if probe_op is None or len(op.output_names) != len(probe_op.output_names):
+        if probe_op is None:
+            continue
+        if isinstance(op.output_template, SequenceOutputTemplate) and isinstance(
+            probe_op.output_template,
+            SequenceOutputTemplate,
+        ):
+            for output_name, probe_output_name in zip(
+                op.output_template.element_names,
+                probe_op.output_template.element_names,
+                strict=False,
+            ):
+                probe_meta = probe_op.tensor_metas.get(probe_output_name)
+                if probe_meta is not None:
+                    metas[output_name] = probe_meta
+        if len(op.output_names) != len(probe_op.output_names) and not (
+            isinstance(op.output_template, SequenceOutputTemplate)
+            and isinstance(probe_op.output_template, SequenceOutputTemplate)
+        ):
             continue
         for output_name, probe_output_name in zip(
             op.output_names,
             probe_op.output_names,
-            strict=True,
+            strict=False,
         ):
             probe_meta = probe_op.tensor_metas.get(probe_output_name)
             if probe_meta is not None:
@@ -815,6 +1148,44 @@ def _replace_matching_batch_constants(value: Any, traced_batch: int, symbol: str
     return value
 
 
+def _compatible_container_structure(left: Any, right: Any) -> bool:
+    if isinstance(left, NodeArg) and isinstance(right, NodeArg):
+        return True
+    if isinstance(left, SequenceOutputTemplate) and isinstance(right, SequenceOutputTemplate):
+        return left.container_type == right.container_type
+    if isinstance(left, SequenceArg) and isinstance(right, SequenceArg):
+        return left.container_type == right.container_type
+    if isinstance(left, SequenceElementArg) and isinstance(right, SequenceElementArg):
+        return left.sequence_name == right.sequence_name and left.index == right.index
+    if isinstance(left, (ParamArg, BufferArg, TensorAttrArg, ConstantTensorArg)):
+        return type(left) is type(right)
+    if isinstance(left, tuple):
+        return (
+            isinstance(right, tuple)
+            and len(left) == len(right)
+            and all(
+                _compatible_container_structure(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        )
+    if isinstance(left, list):
+        return (
+            isinstance(right, list)
+            and len(left) == len(right)
+            and all(
+                _compatible_container_structure(left_item, right_item)
+                for left_item, right_item in zip(left, right, strict=True)
+            )
+        )
+    if isinstance(left, dict):
+        return (
+            isinstance(right, dict)
+            and left.keys() == right.keys()
+            and all(_compatible_container_structure(left[key], right[key]) for key in left)
+        )
+    return type(left) is type(right)
+
+
 def resolve_template(
     value: Any,
     *,
@@ -825,6 +1196,11 @@ def resolve_template(
 ) -> Any:
     if isinstance(value, NodeArg):
         return env[value.name]
+    if isinstance(value, SequenceArg):
+        sequence = env[value.name]
+        return _coerce_sequence_container(sequence, value.container_type)
+    if isinstance(value, SequenceElementArg):
+        return env[value.sequence_name][value.index]
     if isinstance(value, ParamArg):
         return parameters[value.name]
     if isinstance(value, BufferArg):
@@ -886,7 +1262,31 @@ def resolve_template(
 def assign_template(value: Any, template: Any, env: dict[str, Any]) -> None:
     if isinstance(template, NodeArg):
         env[template.name] = value
+    elif isinstance(template, SequenceOutputTemplate):
+        if not isinstance(value, (tuple, list)):
+            raise RuntimeTraceError(
+                "Expected a Python sequence for dynamic sequence output "
+                f"{template.name!r}, got {type(value).__name__}."
+            )
+        expected_length = _materialize_length_expr(template.length_expr, env)
+        if len(value) != expected_length:
+            raise RuntimeTraceError(
+                "Dynamic sequence length changed in a non-symbolic way "
+                f"for {template.name!r}: expected {expected_length}, got {len(value)}."
+            )
+        env[template.name] = _coerce_sequence_container(value, template.container_type)
     elif isinstance(template, (tuple, list)):
+        if not isinstance(value, type(template)):
+            raise RuntimeTraceError(
+                "Captured Python container type changed at replay time "
+                f"({type(template).__name__} traced, {type(value).__name__} runtime)."
+            )
+        if len(value) != len(template):
+            raise RuntimeTraceError(
+                "Captured Python container length changed at replay time "
+                f"({len(template)} traced element(s), {len(value)} runtime element(s)). "
+                "Trace with a stable container structure or choose a different split boundary."
+            )
         for item, item_template in zip(value, template, strict=True):
             assign_template(item, item_template, env)
     elif isinstance(template, dict):
@@ -897,6 +1297,12 @@ def assign_template(value: Any, template: Any, env: dict[str, Any]) -> None:
 def materialize_template(value: Any, env: dict[str, Any]) -> Any:
     if isinstance(value, NodeArg):
         return env[value.name]
+    if isinstance(value, SequenceArg):
+        return _coerce_sequence_container(env[value.name], value.container_type)
+    if isinstance(value, SequenceElementArg):
+        return env[value.sequence_name][value.index]
+    if isinstance(value, SequenceOutputTemplate):
+        return _coerce_sequence_container(env[value.name], value.container_type)
     if isinstance(value, tuple):
         return tuple(materialize_template(item, env) for item in value)
     if isinstance(value, list):
@@ -908,6 +1314,12 @@ def materialize_template(value: Any, env: dict[str, Any]) -> Any:
 
 def _node_refs(value: Any) -> list[str]:
     if isinstance(value, NodeArg):
+        return [value.name]
+    if isinstance(value, SequenceArg):
+        return [value.name]
+    if isinstance(value, SequenceElementArg):
+        return [value.sequence_name]
+    if isinstance(value, SequenceOutputTemplate):
         return [value.name]
     if isinstance(value, tuple):
         return [name for item in value for name in _node_refs(item)]
@@ -925,6 +1337,8 @@ def _param_refs(*values: Any) -> list[str]:
     for value in values:
         if isinstance(value, ParamArg):
             refs.append(value.name)
+        elif isinstance(value, (SequenceArg, SequenceElementArg, SequenceOutputTemplate)):
+            continue
         elif isinstance(value, (tuple, list)):
             refs.extend(name for item in value for name in _param_refs(item))
         elif isinstance(value, dict):
@@ -939,6 +1353,8 @@ def _buffer_refs(*values: Any) -> list[str]:
     for value in values:
         if isinstance(value, BufferArg):
             refs.append(value.name)
+        elif isinstance(value, (SequenceArg, SequenceElementArg, SequenceOutputTemplate)):
+            continue
         elif isinstance(value, (tuple, list)):
             refs.extend(name for item in value for name in _buffer_refs(item))
         elif isinstance(value, dict):
@@ -946,6 +1362,28 @@ def _buffer_refs(*values: Any) -> list[str]:
         elif isinstance(value, slice):
             refs.extend(_buffer_refs(value.start, value.stop, value.step))
     return refs
+
+
+def _materialize_length_expr(value: int | BatchDimArg | ShapeExpr, env: dict[str, Any]) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, BatchDimArg):
+        symbol_value = env.get(value.symbol)
+        if not isinstance(symbol_value, int):
+            raise RuntimeTraceError(f"Missing batch symbol {value.symbol!r} for sequence length.")
+        return symbol_value
+    symbol_value = env.get(value.expression)
+    if not isinstance(symbol_value, int):
+        raise RuntimeTraceError(f"Missing shape symbol {value.expression!r} for sequence length.")
+    return value.materialize({value.expression: symbol_value})
+
+
+def _coerce_sequence_container(value: Any, container_type: str) -> Any:
+    if container_type == "tuple":
+        return tuple(value)
+    if container_type == "list":
+        return list(value)
+    raise RuntimeTraceError(f"Unsupported dynamic sequence container type {container_type!r}.")
 
 
 def _choose_probe_batch(shape_env: ShapeEnv) -> int | None:
@@ -1086,24 +1524,22 @@ def _target_name(target: Any) -> str:
     return str(name)
 
 
-def _is_shape_sensitive(target: str) -> bool:
-    return any(
-        token in target
-        for token in (
-            "view",
-            "reshape",
-            "flatten",
-            "unflatten",
-            "as_strided",
-            "expand",
-            "repeat",
-            "zeros",
-            "ones",
-            "empty",
-            "randn",
-            "arange",
-        )
+def _is_sequence_producing_target(target: str) -> bool:
+    return any(token in target for token in ("split", "chunk", "unbind"))
+
+
+def _is_tensor_sequence(value: Any) -> bool:
+    return isinstance(value, (tuple, list)) and all(
+        isinstance(item, torch.Tensor) for item in value
     )
+
+
+def _container_type_name(value: Any) -> str:
+    if isinstance(value, tuple):
+        return "tuple"
+    if isinstance(value, list):
+        return "list"
+    raise TypeError(f"Unsupported sequence container type {type(value).__name__}.")
 
 
 def _is_rng_sensitive(target: str) -> bool:
@@ -1121,8 +1557,114 @@ def _id_for_name(names_by_id: dict[int, str], name: str) -> int:
     raise KeyError(name)
 
 
-def _interception_signature(nodes: tuple[TraceNode, ...], shape_env: ShapeEnv) -> str:
-    base = compute_graph_signature(nodes, shape_env)
-    digest = sha256(base.encode())
+def _interception_signature(
+    nodes: tuple[TraceNode, ...],
+    shape_env: ShapeEnv,
+    *,
+    ops: tuple[CapturedOp, ...],
+) -> str:
+    dynamic_sequence_templates = _dynamic_sequence_templates(ops)
+    dynamic_sequence_elements = {
+        element_name
+        for template in dynamic_sequence_templates.values()
+        for element_name in template.element_names
+    }
+    nodes_by_name = {node.name: node for node in nodes}
+
+    digest = sha256()
+    digest.update(shape_env.batch_symbol.encode())
+    digest.update(repr(shape_env.dynamic_batch).encode())
+    digest.update(shape_env.trace_batch_mode.encode())
+    for node in nodes:
+        if node.is_output or node.name in dynamic_sequence_elements:
+            continue
+        digest.update(node.name.encode())
+        digest.update(node.op.encode())
+        digest.update(node.target.encode())
+        digest.update(repr(node.parents).encode())
+        if node.tensor_meta is not None:
+            digest.update(repr(node.tensor_meta.symbolic_shape).encode())
+            digest.update(node.tensor_meta.dtype.encode())
+        sequence_template = dynamic_sequence_templates.get(node.name)
+        if sequence_template is not None:
+            element_meta = _dynamic_sequence_element_meta(sequence_template, nodes_by_name)
+            digest.update(repr(_template_schema(sequence_template.length_expr)).encode())
+            if element_meta is not None:
+                digest.update(repr(element_meta.symbolic_shape).encode())
+                digest.update(element_meta.dtype.encode())
+
     digest.update(b"interception")
+    for node in nodes:
+        if node.name in dynamic_sequence_elements:
+            continue
+        digest.update(repr(_template_schema(node.args_template)).encode())
+        digest.update(repr(_template_schema(node.kwargs_template)).encode())
+    for op in ops:
+        digest.update(repr(_template_schema(op.output_template)).encode())
     return digest.hexdigest()[:16]
+
+
+def _dynamic_sequence_templates(ops: tuple[CapturedOp, ...]) -> dict[str, SequenceOutputTemplate]:
+    return {
+        op.output_template.name: op.output_template
+        for op in ops
+        if (
+            isinstance(op.output_template, SequenceOutputTemplate)
+            and not isinstance(op.output_template.length_expr, int)
+        )
+    }
+
+
+def _dynamic_sequence_element_meta(
+    template: SequenceOutputTemplate,
+    nodes_by_name: dict[str, TraceNode],
+) -> TensorMeta | None:
+    for element_name in template.element_names:
+        node = nodes_by_name.get(element_name)
+        if node is not None and node.tensor_meta is not None:
+            return node.tensor_meta
+    return None
+
+
+def _template_schema(value: Any) -> Any:
+    if isinstance(value, NodeArg):
+        return ("node", value.name)
+    if isinstance(value, SequenceArg):
+        return ("sequence", value.name, value.container_type)
+    if isinstance(value, SequenceElementArg):
+        return ("sequence_element", value.sequence_name, value.index)
+    if isinstance(value, SequenceOutputTemplate):
+        element_schema = value.element_names if isinstance(value.length_expr, int) else ("*",)
+        return (
+            "sequence_output",
+            value.name,
+            value.container_type,
+            _template_schema(value.length_expr),
+            element_schema,
+        )
+    if isinstance(value, BatchDimArg):
+        return ("batch", value.symbol)
+    if isinstance(value, ShapeExpr):
+        return ("shape_expr", value.expression, value.multiplier, value.offset)
+    if isinstance(value, ParamArg):
+        return ("param", value.name)
+    if isinstance(value, BufferArg):
+        return ("buffer", value.name)
+    if isinstance(value, TensorAttrArg):
+        return ("tensor_attr", value.path)
+    if isinstance(value, ConstantTensorArg):
+        return ("constant_tensor", tuple(value.value.shape), str(value.value.dtype))
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_template_schema(item) for item in value))
+    if isinstance(value, list):
+        return ("list", tuple(_template_schema(item) for item in value))
+    if isinstance(value, dict):
+        return ("dict", tuple((key, _template_schema(item)) for key, item in value.items()))
+    if isinstance(value, slice):
+        return (
+            "slice",
+            _template_schema(value.start),
+            _template_schema(value.stop),
+            _template_schema(value.step),
+        )
+    return value

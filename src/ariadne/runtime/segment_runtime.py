@@ -11,14 +11,15 @@ import torch
 
 from ariadne.codegen.interception_segments import as_debug_interpreter
 from ariadne.codegen.segment_builder import SegmentBundle
+from ariadne.pattern.boundary_value import encode_boundary_value, materialize_boundary_value
 from ariadne.pattern.split_spec import SplitSpec
 from ariadne.planner.frontier import SplitCandidate
+from ariadne.runtime.batching import batch_size_from_inputs, validate_inputs
 from ariadne.runtime.boundary import BoundaryPayload, validate_boundary_payload
 from ariadne.runtime.train_runtime import (
     backward_prefix_from_boundary,
     train_suffix,
 )
-from ariadne.trace.tensor_meta import ShapeExpr
 from ariadne.trace.trace_plan import TracePlan
 
 BoundaryGradients = dict[str, torch.Tensor | None]
@@ -132,11 +133,13 @@ class SplitRuntime:
         batch_size: int,
         supports_prefix_backward: bool,
     ) -> BoundaryPayload:
-        tensors = {
-            label: value
-            for label, value in zip(self.segments.boundary_order, boundary_values, strict=True)
-            if isinstance(value, torch.Tensor)
-        }
+        value_schema = self._boundary_value_schema()
+        tensors: dict[str, torch.Tensor] = {}
+        payload_values: list[Any] = []
+        for value, spec in zip(boundary_values, value_schema, strict=True):
+            encoded, value_tensors = encode_boundary_value(value, spec)
+            payload_values.append(encoded)
+            tensors.update(value_tensors)
         passthrough_inputs = {
             label: inputs[self.trace_plan.input_node_names.index(label)]
             for label in self.segments.passthrough_order
@@ -153,6 +156,8 @@ class SplitRuntime:
             prefix_backward_owner_id=(
                 self.prefix_backward_owner_id if supports_prefix_backward else None
             ),
+            values=tuple(payload_values),
+            value_schema=value_schema,
         )
 
     def run_suffix(self, boundary: BoundaryPayload) -> Any:
@@ -212,53 +217,31 @@ class SplitRuntime:
             graph_signature=self.graph_signature,
             schema=self.candidate.boundary_schema,
             shape_env=self.trace_plan.shape_env,
+            value_schema=self._boundary_value_schema(),
         )
 
     def _suffix_inputs(self, boundary: BoundaryPayload) -> tuple[Any, ...]:
-        boundary_values = tuple(boundary.tensors[label] for label in self.segments.boundary_order)
+        value_schema = self._boundary_value_schema()
+        boundary_values = tuple(
+            materialize_boundary_value(value, spec, boundary.tensors)
+            for value, spec in zip(boundary.values, value_schema, strict=True)
+        )
         passthrough_values = tuple(
             boundary.passthrough_inputs[label] for label in self.segments.passthrough_order
         )
         return (*boundary_values, *passthrough_values)
 
+    def _boundary_value_schema(self) -> tuple[Any, ...]:
+        return tuple(
+            self.candidate.boundary_value_schema[label]
+            for label in self.segments.boundary_order
+        )
+
     def _validate_inputs(self, inputs: tuple[Any, ...]) -> None:
-        batch_size = self._batch_size_from_inputs(inputs)
-        self.trace_plan.shape_env.validate_batch(batch_size)
-        for index, meta in enumerate(self.trace_plan.input_metas):
-            if meta is None or index >= len(inputs) or not isinstance(inputs[index], torch.Tensor):
-                continue
-            tensor = inputs[index]
-            if tensor.ndim != len(meta.symbolic_shape):
-                raise ValueError(
-                    f"Input {index} rank {tensor.ndim} does not match traced rank "
-                    f"{len(meta.symbolic_shape)}."
-                )
-            for dim_index, (actual, expected) in enumerate(
-                zip(tensor.shape, meta.symbolic_shape, strict=True)
-            ):
-                if expected == self.trace_plan.shape_env.batch_symbol:
-                    continue
-                if isinstance(expected, ShapeExpr):
-                    expected_int = expected.materialize(
-                        {self.trace_plan.shape_env.batch_symbol: batch_size}
-                    )
-                    if int(actual) != expected_int:
-                        raise ValueError(
-                            f"Input {index} dimension {dim_index} is {int(actual)}; "
-                            f"expected {expected_int} from {expected}."
-                        )
-                    continue
-                if isinstance(expected, int) and int(actual) != expected:
-                    raise ValueError(
-                        f"Input {index} dimension {dim_index} is {int(actual)}; "
-                        f"expected {expected}."
-                    )
+        validate_inputs(self.trace_plan, inputs)
 
     def _batch_size_from_inputs(self, inputs: tuple[Any, ...]) -> int:
-        for value in inputs:
-            if isinstance(value, torch.Tensor) and value.ndim > 0:
-                return int(value.shape[0])
-        raise ValueError("Ariadne requires at least one batched tensor input.")
+        return batch_size_from_inputs(inputs)
 
     def _variant_for_batch(self, batch_size: int) -> SplitRuntime | None:
         for variant in self.variants:

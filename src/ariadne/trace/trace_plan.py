@@ -25,6 +25,8 @@ class TraceNode:
     param_refs: tuple[ParamRef, ...] = ()
     buffer_refs: tuple[BufferRef, ...] = ()
     module_path: str | None = None
+    op_index: int | None = None
+    output_index: int | None = None
     alias_metadata: dict[str, Any] | None = None
     mutation_metadata: dict[str, Any] | None = None
     rng_sensitive: bool = False

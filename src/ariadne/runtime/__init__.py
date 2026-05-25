@@ -1,6 +1,6 @@
 """Runtime execution."""
 
-from ariadne.runtime.boundary import BoundaryPayload
+from ariadne.runtime.boundary import BoundaryPayload, register_boundary_serializer
 from ariadne.runtime.replay_runtime import (
     ReplayBoundary,
     SplitReplayRuntime,
@@ -12,4 +12,5 @@ __all__ = [
     "ReplayBoundary",
     "SplitReplayRuntime",
     "SplitRuntime",
+    "register_boundary_serializer",
 ]

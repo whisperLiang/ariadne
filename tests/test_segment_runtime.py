@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch import nn
@@ -72,28 +74,12 @@ def test_boundary_validation_rejects_missing_label_and_wrong_static_dim() -> Non
 
     missing = dict(boundary.tensors)
     missing.pop(label)
-    bad_missing = boundary.__class__(
-        split_id=boundary.split_id,
-        graph_signature=boundary.graph_signature,
-        batch_size=boundary.batch_size,
-        tensors=missing,
-        schema=boundary.schema,
-        requires_grad=boundary.requires_grad,
-        passthrough_inputs=boundary.passthrough_inputs,
-    )
+    bad_missing = replace(boundary, tensors=missing)
     with pytest.raises(ValueError, match="missing"):
         runtime.run_suffix(bad_missing)
 
     bad_tensors = dict(boundary.tensors)
     bad_tensors[label] = torch.randn(4, 9)
-    bad_shape = boundary.__class__(
-        split_id=boundary.split_id,
-        graph_signature=boundary.graph_signature,
-        batch_size=boundary.batch_size,
-        tensors=bad_tensors,
-        schema=boundary.schema,
-        requires_grad=boundary.requires_grad,
-        passthrough_inputs=boundary.passthrough_inputs,
-    )
+    bad_shape = replace(boundary, tensors=bad_tensors)
     with pytest.raises(ValueError, match="dimension 1"):
         runtime.run_suffix(bad_shape)

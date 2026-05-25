@@ -9,6 +9,7 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 .ariadne_models/
+artifacts/
 *.pt
 *.pth
 

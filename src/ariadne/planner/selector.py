@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from math import isclose
 from typing import Any
 
@@ -16,20 +16,24 @@ def select_split(
     *,
     split: SplitSpec | str,
     objective: Mapping[str, Any] | None = None,
+    candidates: Sequence[SplitCandidate] | None = None,
 ) -> SplitCandidate:
-    candidates = list(enumerate_frontier_splits(plan))
-    if not candidates:
+    all_candidates = list(candidates if candidates is not None else enumerate_frontier_splits(plan))
+    valid_candidates = [
+        candidate for candidate in all_candidates if candidate.rejection_reason is None
+    ]
+    if not all_candidates:
         raise ValueError("No valid frontier split candidates were found.")
 
     if split == "auto":
         return _select_auto(
-            candidates,
+            valid_candidates,
             objective,
             require_trainable_suffix=False,
         )
     if isinstance(split, SplitSpec) and split.boundary == "auto":
         return _select_auto(
-            candidates,
+            valid_candidates,
             objective,
             require_trainable_suffix=split.trainable,
         )
@@ -40,19 +44,35 @@ def select_split(
     percent = parse_boundary_percent(split.boundary)
     if percent is not None:
         return _select_percent_candidate(
-            candidates,
+            valid_candidates,
             percent,
             require_trainable_suffix=split.trainable,
         )
 
     requested = split.boundary.removeprefix("after:")
     matches = [
-        candidate for candidate in candidates if _matches_boundary(plan, candidate, requested)
+        candidate for candidate in all_candidates if _matches_boundary(plan, candidate, requested)
     ]
     if not matches:
-        labels = ", ".join(f"after:{candidate.boundary_after}" for candidate in candidates)
+        labels = ", ".join(f"after:{candidate.boundary_after}" for candidate in all_candidates)
         raise ValueError(f"No split matches {split.boundary!r}. Available split labels: {labels}.")
-    selected = matches[-1]
+    module_exits = [
+        candidate
+        for candidate in matches
+        if _is_module_exit_candidate(plan, candidate, requested)
+    ]
+    selected = (
+        min(
+            module_exits,
+            key=lambda candidate: _module_exit_rank(plan, candidate, requested),
+        )
+        if module_exits
+        else matches[-1]
+    )
+    if selected.rejection_reason is not None:
+        raise ValueError(
+            f"Split {split.boundary!r} is not replayable: {selected.rejection_reason}"
+        )
     if split.trainable and not selected.trainable_suffix:
         raise ValueError(f"Split {split.boundary!r} does not have trainable suffix parameters.")
     return selected
@@ -119,12 +139,69 @@ def _matches_boundary(plan: TracePlan, candidate: SplitCandidate, requested: str
         or candidate_node.module_path.startswith(f"{requested}.")
     ):
         return True
-    requested_nodes = [
+    requested_nodes = _requested_module_nodes(plan, requested)
+    if requested_nodes and requested_nodes[-1].name == candidate_node.name:
+        return True
+    if requested_nodes:
+        last_requested_index = max(plan.index_of(node.name) for node in requested_nodes)
+        candidate_index = plan.index_of(candidate_node.name)
+        if candidate_index > last_requested_index:
+            intervening = plan.nodes[last_requested_index + 1 : candidate_index]
+            return all(not node.is_compute for node in intervening)
+    return False
+
+
+def _is_module_exit_candidate(
+    plan: TracePlan,
+    candidate: SplitCandidate,
+    requested: str,
+) -> bool:
+    requested_nodes = _requested_module_nodes(plan, requested)
+    if not requested_nodes:
+        return False
+    if any(
+        _module_path_matches(plan.get_node(name).module_path, requested)
+        for name in candidate.suffix_nodes
+    ):
+        return False
+    candidate_node = _node_for_candidate(plan, candidate)
+    candidate_index = plan.index_of(candidate_node.name)
+    first_requested_index = min(plan.index_of(node.name) for node in requested_nodes)
+    return candidate_index >= first_requested_index
+
+
+def _module_exit_rank(
+    plan: TracePlan,
+    candidate: SplitCandidate,
+    requested: str,
+) -> tuple[int, int]:
+    candidate_node = _node_for_candidate(plan, candidate)
+    candidate_index = plan.index_of(candidate_node.name)
+    requested_nodes = _requested_module_nodes(plan, requested)
+    requested_indexes = [plan.index_of(node.name) for node in requested_nodes]
+    last_requested_index = max(requested_indexes) if requested_indexes else candidate_index
+
+    if candidate.boundary_after == requested or candidate_node.module_path == requested:
+        return (0, candidate_index)
+    if candidate_index > last_requested_index:
+        intervening = plan.nodes[last_requested_index + 1 : candidate_index]
+        if all(not node.is_compute for node in intervening):
+            return (1, candidate_index)
+    if _module_path_matches(candidate_node.module_path, requested):
+        return (2, candidate_index)
+    return (3, candidate_index)
+
+
+def _requested_module_nodes(plan: TracePlan, requested: str) -> list[TraceNode]:
+    return [
         node
         for node in plan.nodes
         if node.module_path == requested or (node.module_path or "").startswith(f"{requested}.")
     ]
-    return bool(requested_nodes and requested_nodes[-1].name == candidate_node.name)
+
+
+def _module_path_matches(module_path: str | None, requested: str) -> bool:
+    return module_path == requested or (module_path or "").startswith(f"{requested}.")
 
 
 def _node_for_candidate(plan: TracePlan, candidate: SplitCandidate) -> TraceNode:

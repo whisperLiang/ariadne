@@ -4,8 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ariadne.pattern.boundary_value import (
+    BoundarySequenceValueSpec,
+    BoundaryTensorValueSpec,
+    BoundaryValueSpec,
+)
 from ariadne.pattern.shape_pattern import BoundaryTensorSpec
 from ariadne.planner.cost_model import SplitCost, estimate_split_cost
+from ariadne.trace.interception import (
+    BatchDimArg,
+    InterceptionTraceArtifact,
+    SequenceOutputTemplate,
+)
+from ariadne.trace.tensor_meta import ShapeExpr, TensorMeta
 from ariadne.trace.trace_plan import TraceNode, TracePlan
 
 _PLANNING_AUXILIARY_TARGETS = frozenset({"detach.default", "empty.memory_format"})
@@ -21,42 +32,43 @@ class SplitCandidate:
     prefix_nodes: tuple[str, ...]
     suffix_nodes: tuple[str, ...]
     boundary_schema: dict[str, BoundaryTensorSpec]
+    boundary_value_schema: dict[str, BoundaryValueSpec]
     passthrough_inputs: tuple[str, ...]
     cost: SplitCost
     trainable_suffix: bool
+    rejection_reason: str | None = None
 
 
 def enumerate_frontier_splits(plan: TracePlan) -> tuple[SplitCandidate, ...]:
-    """Enumerate valid one-frontier splits over a TracePlan."""
+    """Enumerate valid one-frontier splits over captured operation groups."""
     auxiliary_nodes = _planning_auxiliary_node_names(plan)
-    compute_nodes = [
-        node
-        for node in plan.nodes
-        if (
-            node.is_compute
-            and node.name not in auxiliary_nodes
-            and not _is_non_split_auxiliary_node(node)
-        )
-    ]
     candidates: list[SplitCandidate] = []
-    for split_node in compute_nodes:
-        candidate = _candidate_after(plan, split_node, auxiliary_nodes)
+    for group in _split_frontier_groups(plan, auxiliary_nodes):
+        candidate = _candidate_after_group(plan, group, auxiliary_nodes)
         if candidate is not None:
             candidates.append(candidate)
     return tuple(candidates)
 
 
-def _candidate_after(
+def _candidate_after_group(
     plan: TracePlan,
-    split_node: TraceNode,
+    split_group: tuple[TraceNode, ...],
     auxiliary_nodes: frozenset[str],
 ) -> SplitCandidate | None:
-    split_index = plan.index_of(split_node.name)
+    split_op_index = split_group[-1].op_index
+    split_index = plan.index_of(split_group[-1].name)
+
     prefix_set = {
         node.name
-        for node in plan.nodes[: split_index + 1]
+        for node in plan.nodes
         if (
-            node.name not in auxiliary_nodes
+            _is_prefix_cut(
+                plan,
+                node,
+                split_op_index=split_op_index,
+                split_index=split_index,
+            )
+            and node.name not in auxiliary_nodes
             and not node.is_output
             and not node.is_attr
             and not node.is_placeholder
@@ -64,9 +76,15 @@ def _candidate_after(
     }
     suffix_set = {
         node.name
-        for node in plan.nodes[split_index + 1 :]
+        for node in plan.nodes
         if (
-            node.name not in auxiliary_nodes
+            _is_suffix_cut(
+                plan,
+                node,
+                split_op_index=split_op_index,
+                split_index=split_index,
+            )
+            and node.name not in auxiliary_nodes
             and not node.is_output
             and not node.is_attr
             and not node.is_placeholder
@@ -77,10 +95,25 @@ def _candidate_after(
 
     suffix_and_output = [
         node
-        for node in plan.nodes[split_index + 1 :]
-        if node.name not in auxiliary_nodes and (node.is_compute or node.is_output)
+        for node in plan.nodes
+        if (
+            node.name not in auxiliary_nodes
+            and (
+                node.is_output
+                or (
+                    node.is_compute
+                    and _is_suffix_cut(
+                        plan,
+                        node,
+                        split_op_index=split_op_index,
+                        split_index=split_index,
+                    )
+                )
+            )
+        )
     ]
     boundary_nodes: list[str] = []
+    boundary_value_schema: dict[str, BoundaryValueSpec] = {}
     passthrough_inputs: list[str] = []
     hidden_prefix_deps: list[str] = []
     placeholders = set(plan.input_node_names)
@@ -90,28 +123,37 @@ def _candidate_after(
             if parent in placeholders:
                 _append_unique(passthrough_inputs, parent)
             elif parent in prefix_set:
-                parent_node = plan.get_node(parent)
-                if parent_node.tensor_meta is None:
+                value_spec = _boundary_value_spec_for_node(plan, parent)
+                if value_spec is None:
                     hidden_prefix_deps.append(parent)
                 else:
                     _append_unique(boundary_nodes, parent)
+                    boundary_value_schema[parent] = value_spec
+            elif parent not in suffix_set:
+                hidden_prefix_deps.append(parent)
 
-    if hidden_prefix_deps or not boundary_nodes:
+    rejection_reason = None
+    if hidden_prefix_deps:
+        rejection_reason = _hidden_dependency_rejection_reason(plan, hidden_prefix_deps)
+    elif not boundary_nodes:
         return None
 
     schema = {
         label: BoundaryTensorSpec.from_meta(label, plan.get_node(label).tensor_meta)  # type: ignore[arg-type]
         for label in boundary_nodes
+        if plan.get_node(label).tensor_meta is not None
     }
     prefix_nodes = tuple(node.name for node in plan.nodes if node.name in prefix_set)
     suffix_nodes = tuple(node.name for node in plan.nodes if node.name in suffix_set)
     trainable_suffix = any(plan.get_node(name).param_refs for name in suffix_nodes)
     cost = estimate_split_cost(
         schema=schema,
+        value_schema=boundary_value_schema,
         nodes=plan.nodes,
         prefix_nodes=prefix_nodes,
         suffix_nodes=suffix_nodes,
     )
+    split_node = split_group[-1]
     split_id = f"after:{_friendly_boundary_label(split_node)}"
     return SplitCandidate(
         split_id=split_id,
@@ -120,14 +162,141 @@ def _candidate_after(
         prefix_nodes=prefix_nodes,
         suffix_nodes=suffix_nodes,
         boundary_schema=schema,
+        boundary_value_schema=boundary_value_schema,
         passthrough_inputs=tuple(passthrough_inputs),
         cost=cost,
         trainable_suffix=trainable_suffix,
+        rejection_reason=rejection_reason,
     )
+
+
+def _split_frontier_groups(
+    plan: TracePlan,
+    auxiliary_nodes: frozenset[str],
+) -> tuple[tuple[TraceNode, ...], ...]:
+    groups: dict[int, list[TraceNode]] = {}
+    fallback_groups: list[tuple[TraceNode, ...]] = []
+    for node in plan.nodes:
+        if (
+            not node.is_compute
+            or node.name in auxiliary_nodes
+            or _is_non_split_auxiliary_node(node)
+        ):
+            continue
+        if node.op_index is None:
+            fallback_groups.append((node,))
+            continue
+        groups.setdefault(node.op_index, []).append(node)
+    ordered_groups = [
+        tuple(nodes)
+        for _op_index, nodes in sorted(groups.items(), key=lambda item: item[0])
+        if nodes
+    ]
+    return (*ordered_groups, *fallback_groups)
+
+
+def _is_prefix_cut(
+    plan: TracePlan,
+    node: TraceNode,
+    *,
+    split_op_index: int | None,
+    split_index: int,
+) -> bool:
+    if split_op_index is None:
+        return plan.index_of(node.name) <= split_index
+    return node.op_index is not None and node.op_index <= split_op_index
+
+
+def _is_suffix_cut(
+    plan: TracePlan,
+    node: TraceNode,
+    *,
+    split_op_index: int | None,
+    split_index: int,
+) -> bool:
+    if split_op_index is None:
+        return plan.index_of(node.name) > split_index
+    return node.op_index is not None and node.op_index > split_op_index
 
 
 def _friendly_boundary_label(node: TraceNode) -> str:
     return node.module_path or node.name
+
+
+def _boundary_value_spec_for_node(
+    plan: TracePlan,
+    node_name: str,
+) -> BoundaryValueSpec | None:
+    node = plan.get_node(node_name)
+    if node.tensor_meta is not None:
+        tensor_spec = BoundaryTensorSpec.from_meta(node_name, node.tensor_meta)
+        return BoundaryTensorValueSpec(node_name, tensor_spec)
+
+    sequence_template = _sequence_output_template_for_node(plan, node_name)
+    if sequence_template is None or not sequence_template.element_names:
+        return None
+    first_element = plan.get_node(sequence_template.element_names[0])
+    if first_element.tensor_meta is None:
+        return None
+    element_tensor_spec = _sequence_element_tensor_spec(
+        plan,
+        f"{node_name}.*",
+        first_element.tensor_meta,
+    )
+    return BoundarySequenceValueSpec(
+        label=node_name,
+        container_type=sequence_template.container_type,
+        length_expr=_boundary_length_expr(sequence_template.length_expr),
+        element_spec=BoundaryTensorValueSpec(f"{node_name}.*", element_tensor_spec),
+    )
+
+
+def _sequence_output_template_for_node(
+    plan: TracePlan,
+    node_name: str,
+) -> SequenceOutputTemplate | None:
+    artifact = plan.runtime_artifact
+    if not isinstance(artifact, InterceptionTraceArtifact):
+        return None
+    for op in artifact.ops:
+        if (
+            isinstance(op.output_template, SequenceOutputTemplate)
+            and op.output_template.name == node_name
+        ):
+            return op.output_template
+    return None
+
+
+def _boundary_length_expr(value: int | BatchDimArg | ShapeExpr) -> int | str | ShapeExpr:
+    if isinstance(value, BatchDimArg):
+        return value.symbol
+    return value
+
+
+def _sequence_element_tensor_spec(
+    plan: TracePlan,
+    label: str,
+    meta: TensorMeta,
+) -> BoundaryTensorSpec:
+    return BoundaryTensorSpec.from_meta(label, meta)
+
+
+def _hidden_dependency_rejection_reason(
+    plan: TracePlan,
+    hidden_prefix_deps: list[str],
+) -> str:
+    labels: list[str] = []
+    for name in hidden_prefix_deps:
+        try:
+            node = plan.get_node(name)
+        except KeyError:
+            labels.append(name)
+            continue
+        labels.append(node.module_path or node.name)
+    return (
+        "split crosses a dependency that cannot be represented in the structured "
+        f"boundary payload ({', '.join(labels)})"
+    )
 
 
 def _planning_auxiliary_node_names(plan: TracePlan) -> frozenset[str]:

@@ -8,6 +8,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from ariadne.pattern.boundary_value import (
+    detach_boundary_value,
+    encode_boundary_value,
+    materialize_boundary_value,
+)
 from ariadne.runtime.boundary import BoundaryPayload
 
 BoundaryGradients = dict[str, torch.Tensor | None]
@@ -26,19 +31,17 @@ def train_suffix(
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
 
-    detached_tensors: dict[str, torch.Tensor] = {}
     grad_roots: dict[str, torch.Tensor] = {}
-    for label in runtime.segments.boundary_order:
-        tensor = boundary.tensors[label].detach()
-        source_requires_grad = boundary.requires_grad.get(
-            label,
-            boundary.tensors[label].requires_grad,
-        )
-        if source_requires_grad and (tensor.is_floating_point() or tensor.is_complex()):
-            grad_root = tensor.requires_grad_(True)
-            grad_roots[label] = grad_root
-            tensor = grad_root.clone()
-        detached_tensors[label] = tensor
+    detached_items: list[Any] = []
+    detached_tensors = {}
+    value_schema = _runtime_value_schema(runtime)
+    for value, spec in zip(boundary.values, value_schema, strict=True):
+        materialized = materialize_boundary_value(value, spec, boundary.tensors)
+        detached_value, item_grad_roots = detach_boundary_value(materialized, spec)
+        encoded_value, value_tensors = encode_boundary_value(detached_value, spec)
+        detached_items.append(encoded_value)
+        detached_tensors.update(value_tensors)
+        grad_roots.update(item_grad_roots)
 
     detached_boundary = BoundaryPayload(
         split_id=boundary.split_id,
@@ -49,6 +52,8 @@ def train_suffix(
         requires_grad={label: tensor.requires_grad for label, tensor in detached_tensors.items()},
         weight_version=boundary.weight_version,
         passthrough_inputs=boundary.passthrough_inputs,
+        values=tuple(detached_items),
+        value_schema=value_schema,
     )
     outputs = runtime.run_suffix(detached_boundary)
     loss = _default_loss(outputs, targets) if loss_fn is None else loss_fn(outputs, targets)
@@ -57,11 +62,7 @@ def train_suffix(
     if optimizer is not None:
         optimizer.step()
 
-    grads = {
-        label: grad_roots[label].grad
-        for label in runtime.segments.boundary_order
-        if label in grad_roots
-    }
+    grads = {label: grad_root.grad for label, grad_root in grad_roots.items()}
     return loss.detach(), grads
 
 
@@ -89,8 +90,7 @@ def backward_prefix_from_boundary(
 
     tensors: list[torch.Tensor] = []
     grads: list[torch.Tensor] = []
-    for label in runtime.segments.boundary_order:
-        tensor = boundary.tensors[label]
+    for label, tensor in boundary.tensors.items():
         grad = boundary_grads.get(label)
         if grad is not None:
             tensors.append(tensor)
@@ -107,3 +107,10 @@ def _default_loss(outputs: Any, targets: Any) -> torch.Tensor:
             return F.cross_entropy(outputs, targets)
         return F.mse_loss(outputs, targets)
     raise TypeError("A loss_fn is required for non-tensor outputs or targets.")
+
+
+def _runtime_value_schema(runtime: Any) -> tuple[Any, ...]:
+    return tuple(
+        runtime.candidate.boundary_value_schema[label]
+        for label in runtime.segments.boundary_order
+    )
