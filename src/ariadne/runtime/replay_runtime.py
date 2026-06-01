@@ -38,6 +38,8 @@ class ReplayBoundary:
     graph_signature: str
     batch_size: int
     values: tuple[Any, ...]
+    semantic_split_id: str | None = None
+    contract_signature: str | None = None
     passthrough_values: tuple[Any, ...] = ()
     protocol_version: int = 2
     value_schema: tuple[BoundaryValueSpec, ...] = ()
@@ -102,8 +104,16 @@ class SplitReplayRuntime:
         return self.candidate.split_id
 
     @property
+    def semantic_split_id(self) -> str:
+        return self.candidate.semantic_split_id
+
+    @property
     def graph_signature(self) -> str:
         return self.trace_plan.graph_signature
+
+    @property
+    def contract_signature(self) -> str:
+        return self.candidate.contract_signature
 
     @property
     def boundary_order(self) -> tuple[str, ...]:
@@ -171,7 +181,9 @@ class SplitReplayRuntime:
             values = tuple(encoded_values)
         return ReplayBoundary(
             split_id=self.split_id,
+            semantic_split_id=self.semantic_split_id,
             graph_signature=self.graph_signature,
+            contract_signature=self.contract_signature,
             batch_size=batch_size,
             values=values,
             passthrough_values=self._passthrough_values(inputs),
@@ -205,10 +217,10 @@ class SplitReplayRuntime:
 
     def validate_boundary(self, boundary: ReplayBoundary) -> None:
         if self.validation == "fast":
-            if boundary.owner_id != self.owner_id:
-                raise ValueError("ReplayBoundary was produced by a different SplitReplayRuntime.")
             if boundary.protocol_version != 2:
                 raise ValueError("ReplayBoundary only supports protocol_version=2.")
+            if boundary.owner_id != self.owner_id:
+                self._validate_cross_runtime_boundary_header(boundary)
             self.trace_plan.shape_env.validate_batch(boundary.batch_size)
             if len(boundary.values) != len(self.segments.boundary_order):
                 raise ValueError(
@@ -228,7 +240,9 @@ class SplitReplayRuntime:
             self._to_boundary_payload(boundary),
             split_id=self.split_id,
             graph_signature=self.graph_signature,
-            schema=self.candidate.boundary_schema,
+            semantic_split_id=self.semantic_split_id,
+            contract_signature=self.contract_signature,
+            schema=self.candidate.boundary_contract_schema,
             shape_env=self.trace_plan.shape_env,
             value_schema=self._boundary_value_schema(),
         )
@@ -263,11 +277,19 @@ class SplitReplayRuntime:
 
     def _suffix_inputs(self, boundary: ReplayBoundary) -> tuple[Any, ...]:
         value_schema = self._boundary_value_schema()
+        device = _runtime_device(self.trace_plan.root_module)
         values = tuple(
-            materialize_boundary_value(value, spec, boundary.tensors)
+            _move_tree(
+                materialize_boundary_value(value, spec, boundary.tensors),
+                device=device,
+            )
             for value, spec in zip(boundary.values, value_schema, strict=True)
         )
-        return (*values, *boundary.passthrough_values)
+        passthrough_values = tuple(
+            _move_tree(value, device=device)
+            for value in boundary.passthrough_values
+        )
+        return (*values, *passthrough_values)
 
     def _should_materialize_boundary(self) -> bool:
         return (
@@ -280,7 +302,7 @@ class SplitReplayRuntime:
 
     def _boundary_value_schema(self) -> tuple[BoundaryValueSpec, ...]:
         return tuple(
-            self.candidate.boundary_value_schema[label]
+            self.candidate.boundary_contract_value_schema[label]
             for label in self.segments.boundary_order
         )
 
@@ -289,10 +311,10 @@ class SplitReplayRuntime:
             raise ValueError(
                 f"Boundary split_id {boundary.split_id!r} does not match {self.split_id!r}."
             )
-        if boundary.graph_signature != self.graph_signature:
+        if boundary.contract_signature != self.contract_signature:
             raise ValueError(
-                f"Boundary graph_signature {boundary.graph_signature!r} does not match "
-                f"{self.graph_signature!r}."
+                f"Boundary contract_signature {boundary.contract_signature!r} does not match "
+                f"{self.contract_signature!r}."
             )
         tensors = dict(boundary.tensors)
         passthrough_inputs = dict(
@@ -300,15 +322,33 @@ class SplitReplayRuntime:
         )
         return BoundaryPayload(
             split_id=boundary.split_id,
+            semantic_split_id=boundary.semantic_split_id,
             graph_signature=boundary.graph_signature,
+            contract_signature=boundary.contract_signature,
             batch_size=boundary.batch_size,
             tensors=tensors,
-            schema=self.candidate.boundary_schema,
+            schema=self.candidate.boundary_contract_schema,
             requires_grad={label: tensor.requires_grad for label, tensor in tensors.items()},
             passthrough_inputs=passthrough_inputs,
             values=boundary.values,
             value_schema=boundary.value_schema,
         )
+
+    def _validate_cross_runtime_boundary_header(self, boundary: ReplayBoundary) -> None:
+        if boundary.split_id != self.split_id:
+            raise ValueError(
+                f"Boundary split_id {boundary.split_id!r} does not match {self.split_id!r}."
+            )
+        if boundary.semantic_split_id != self.semantic_split_id:
+            raise ValueError(
+                f"Boundary semantic_split_id {boundary.semantic_split_id!r} does not match "
+                f"{self.semantic_split_id!r}."
+            )
+        if boundary.contract_signature != self.contract_signature:
+            raise ValueError(
+                f"Boundary contract_signature {boundary.contract_signature!r} does not match "
+                f"{self.contract_signature!r}."
+            )
 
     def _validate_inputs_for_mode(self, inputs: tuple[Any, ...], *, batch_size: int) -> None:
         if self.validation == "strict":
@@ -330,14 +370,14 @@ class SplitReplayRuntime:
 
     def _variant_for_boundary(self, boundary: ReplayBoundary) -> SplitReplayRuntime | None:
         for variant in self.variants:
-            if boundary.graph_signature != variant.graph_signature:
+            if boundary.contract_signature != variant.contract_signature:
                 continue
             if boundary.split_id != variant.split_id:
                 continue
-            if boundary.owner_id is not None:
-                if boundary.owner_id == variant.owner_id:
-                    return variant
+            if boundary.semantic_split_id != variant.semantic_split_id:
                 continue
+            if boundary.owner_id is not None and boundary.owner_id == variant.owner_id:
+                return variant
             if variant._matches_batch(boundary.batch_size):
                 return variant
         return None
@@ -353,6 +393,28 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
     if isinstance(value, tuple):
         return value
     return (value,)
+
+
+def _runtime_device(module: torch.nn.Module) -> torch.device | None:
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return None
+
+
+def _move_tree(value: Any, *, device: torch.device | None) -> Any:
+    if device is None:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_tree(item, device=device) for item in value)
+    if isinstance(value, list):
+        return [_move_tree(item, device=device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_tree(item, device=device) for key, item in value.items()}
+    return value
 
 
 def _sync_cuda() -> None:

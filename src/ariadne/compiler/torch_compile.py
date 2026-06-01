@@ -39,6 +39,7 @@ def maybe_compile_segments(
             torch.compile(segments.training_prefix, **options),
         ),
         suffix=cast(torch.nn.Module, torch.compile(segments.suffix, **options)),
+        local_boundary_order=segments.local_boundary_order,
         boundary_order=segments.boundary_order,
         passthrough_order=segments.passthrough_order,
     )
@@ -77,6 +78,7 @@ def compile_replay_segments(
     return ReplaySegmentBundle(
         prefix=cast(torch.nn.Module, torch.compile(segments.prefix, **options)),
         suffix=cast(torch.nn.Module, torch.compile(segments.suffix, **options)),
+        local_boundary_order=segments.local_boundary_order,
         boundary_order=segments.boundary_order,
         passthrough_order=segments.passthrough_order,
     )

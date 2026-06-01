@@ -20,6 +20,7 @@ class SegmentBundle:
     prefix: torch.nn.Module
     training_prefix: torch.nn.Module
     suffix: torch.nn.Module
+    local_boundary_order: tuple[str, ...]
     boundary_order: tuple[str, ...]
     passthrough_order: tuple[str, ...]
 
@@ -28,6 +29,7 @@ class SegmentBundle:
 class ReplaySegmentBundle:
     prefix: torch.nn.Module
     suffix: torch.nn.Module
+    local_boundary_order: tuple[str, ...]
     boundary_order: tuple[str, ...]
     passthrough_order: tuple[str, ...]
 
@@ -59,7 +61,8 @@ def build_segments(plan: TracePlan, candidate: SplitCandidate) -> SegmentBundle:
             boundary_order=candidate.boundary_nodes,
             passthrough_order=candidate.passthrough_inputs,
         ),
-        boundary_order=candidate.boundary_nodes,
+        local_boundary_order=candidate.boundary_nodes,
+        boundary_order=candidate.boundary_keys,
         passthrough_order=candidate.passthrough_inputs,
     )
 
@@ -83,7 +86,8 @@ def build_replay_segments(plan: TracePlan, candidate: SplitCandidate) -> ReplayS
             boundary_order=candidate.boundary_nodes,
             passthrough_order=candidate.passthrough_inputs,
         ),
-        boundary_order=candidate.boundary_nodes,
+        local_boundary_order=candidate.boundary_nodes,
+        boundary_order=candidate.boundary_keys,
         passthrough_order=candidate.passthrough_inputs,
     )
 

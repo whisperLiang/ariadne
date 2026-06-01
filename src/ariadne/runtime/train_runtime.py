@@ -45,7 +45,9 @@ def train_suffix(
 
     detached_boundary = BoundaryPayload(
         split_id=boundary.split_id,
+        semantic_split_id=boundary.semantic_split_id,
         graph_signature=boundary.graph_signature,
+        contract_signature=boundary.contract_signature,
         batch_size=boundary.batch_size,
         tensors=detached_tensors,
         schema=boundary.schema,
@@ -94,7 +96,7 @@ def backward_prefix_from_boundary(
         grad = boundary_grads.get(label)
         if grad is not None:
             tensors.append(tensor)
-            grads.append(grad)
+            grads.append(grad.to(tensor.device))
     if tensors:
         torch.autograd.backward(tensors, grads)
     if optimizer is not None:
@@ -111,6 +113,6 @@ def _default_loss(outputs: Any, targets: Any) -> torch.Tensor:
 
 def _runtime_value_schema(runtime: Any) -> tuple[Any, ...]:
     return tuple(
-        runtime.candidate.boundary_value_schema[label]
+        runtime.candidate.boundary_contract_value_schema[label]
         for label in runtime.segments.boundary_order
     )

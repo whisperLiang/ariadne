@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -356,9 +356,10 @@ def _relabel_sequence_element(
     index: int,
 ) -> BoundaryValueSpec:
     if isinstance(spec, BoundaryTensorValueSpec):
+        label = f"{sequence_label}.{index}"
         return BoundaryTensorValueSpec(
-            label=f"{sequence_label}.{index}",
-            tensor_spec=spec.tensor_spec,
+            label=label,
+            tensor_spec=replace(spec.tensor_spec, label=label),
         )
     return spec
 

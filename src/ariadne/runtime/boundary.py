@@ -31,6 +31,8 @@ class BoundaryPayload:
     tensors: dict[str, torch.Tensor]
     schema: dict[str, BoundaryTensorSpec]
     requires_grad: dict[str, bool]
+    semantic_split_id: str | None = None
+    contract_signature: str | None = None
     weight_version: int | None = None
     passthrough_inputs: dict[str, Any] = field(default_factory=dict)
     supports_prefix_backward: bool = False
@@ -48,10 +50,24 @@ def validate_boundary_payload(
     schema: dict[str, BoundaryTensorSpec],
     shape_env: ShapeEnv,
     value_schema: tuple[BoundaryValueSpec, ...] | None = None,
+    semantic_split_id: str | None = None,
+    contract_signature: str | None = None,
 ) -> None:
     if payload.split_id != split_id:
         raise ValueError(f"Boundary split_id {payload.split_id!r} does not match {split_id!r}.")
-    if payload.graph_signature != graph_signature:
+    if semantic_split_id is not None and payload.semantic_split_id != semantic_split_id:
+        raise ValueError(
+            f"Boundary semantic_split_id {payload.semantic_split_id!r} does not match "
+            f"{semantic_split_id!r}."
+        )
+    expected_contract = contract_signature
+    if expected_contract is not None:
+        if payload.contract_signature != expected_contract:
+            raise ValueError(
+                f"Boundary contract_signature {payload.contract_signature!r} does not match "
+                f"{expected_contract!r}."
+            )
+    elif payload.graph_signature != graph_signature:
         raise ValueError(
             f"Boundary graph_signature {payload.graph_signature!r} does not match "
             f"{graph_signature!r}."

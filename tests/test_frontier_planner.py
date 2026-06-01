@@ -76,6 +76,12 @@ class DropoutNet(nn.Module):
         return self.fc2(self.drop(self.fc1(x)))
 
 
+class LayoutCloneNet(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 1).clone()
+        return x.reshape(x.shape[0], -1)
+
+
 def test_frontier_planner_selects_named_module_boundary() -> None:
     plan = trace_model(
         TinyNet(),
@@ -320,6 +326,25 @@ def test_frontier_planner_does_not_offer_parameter_transpose_as_boundary() -> No
 
     assert all(
         plan.get_node(boundary).target != "t.default"
+        for candidate in candidates
+        for boundary in candidate.boundary_nodes
+    )
+
+
+def test_frontier_planner_does_not_offer_layout_only_clone_as_boundary() -> None:
+    plan = trace_model(
+        LayoutCloneNet(),
+        example_inputs=(torch.randn(4, 3, 5),),
+        dynamic_batch=(2, 16),
+        trace_batch_mode="batch_gt1",
+    )
+
+    assert any(node.target == "clone.default" for node in plan.nodes)
+
+    candidates = enumerate_frontier_splits(plan)
+
+    assert all(
+        plan.get_node(boundary).target != "clone.default"
         for candidate in candidates
         for boundary in candidate.boundary_nodes
     )

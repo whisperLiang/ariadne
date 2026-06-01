@@ -59,8 +59,16 @@ class SplitRuntime:
         return self.candidate.split_id
 
     @property
+    def semantic_split_id(self) -> str:
+        return self.candidate.semantic_split_id
+
+    @property
     def graph_signature(self) -> str:
         return self.trace_plan.graph_signature
+
+    @property
+    def contract_signature(self) -> str:
+        return self.candidate.contract_signature
 
     def visualize(
         self,
@@ -146,10 +154,12 @@ class SplitRuntime:
         }
         return BoundaryPayload(
             split_id=self.split_id,
+            semantic_split_id=self.semantic_split_id,
             graph_signature=self.graph_signature,
+            contract_signature=self.contract_signature,
             batch_size=batch_size,
             tensors=tensors,
-            schema=self.candidate.boundary_schema,
+            schema=self.candidate.boundary_contract_schema,
             requires_grad={label: tensor.requires_grad for label, tensor in tensors.items()},
             passthrough_inputs=passthrough_inputs,
             supports_prefix_backward=supports_prefix_backward,
@@ -215,25 +225,32 @@ class SplitRuntime:
             boundary,
             split_id=self.split_id,
             graph_signature=self.graph_signature,
-            schema=self.candidate.boundary_schema,
+            semantic_split_id=self.semantic_split_id,
+            contract_signature=self.contract_signature,
+            schema=self.candidate.boundary_contract_schema,
             shape_env=self.trace_plan.shape_env,
             value_schema=self._boundary_value_schema(),
         )
 
     def _suffix_inputs(self, boundary: BoundaryPayload) -> tuple[Any, ...]:
         value_schema = self._boundary_value_schema()
+        device = _runtime_device(self.trace_plan.root_module)
         boundary_values = tuple(
-            materialize_boundary_value(value, spec, boundary.tensors)
+            _move_tree(
+                materialize_boundary_value(value, spec, boundary.tensors),
+                device=device,
+            )
             for value, spec in zip(boundary.values, value_schema, strict=True)
         )
         passthrough_values = tuple(
-            boundary.passthrough_inputs[label] for label in self.segments.passthrough_order
+            _move_tree(boundary.passthrough_inputs[label], device=device)
+            for label in self.segments.passthrough_order
         )
         return (*boundary_values, *passthrough_values)
 
     def _boundary_value_schema(self) -> tuple[Any, ...]:
         return tuple(
-            self.candidate.boundary_value_schema[label]
+            self.candidate.boundary_contract_value_schema[label]
             for label in self.segments.boundary_order
         )
 
@@ -252,8 +269,9 @@ class SplitRuntime:
     def _variant_for_boundary(self, boundary: BoundaryPayload) -> SplitRuntime | None:
         for variant in self.variants:
             if (
-                boundary.graph_signature == variant.graph_signature
+                boundary.contract_signature == variant.contract_signature
                 and boundary.split_id == variant.split_id
+                and boundary.semantic_split_id == variant.semantic_split_id
             ):
                 return variant
         return None
@@ -269,3 +287,25 @@ def _as_tuple(value: Any) -> tuple[Any, ...]:
     if isinstance(value, tuple):
         return value
     return (value,)
+
+
+def _runtime_device(module: torch.nn.Module) -> torch.device | None:
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return None
+
+
+def _move_tree(value: Any, *, device: torch.device | None) -> Any:
+    if device is None:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_tree(item, device=device) for item in value)
+    if isinstance(value, list):
+        return [_move_tree(item, device=device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_tree(item, device=device) for key, item in value.items()}
+    return value

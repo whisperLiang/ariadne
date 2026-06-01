@@ -26,7 +26,7 @@ class BoundaryTensorSpec:
             symbolic_shape=meta.symbolic_shape,
             dtype=meta.dtype,
             requires_grad=meta.requires_grad,
-            device_type=None if meta.device_type == "meta" else meta.device_type,
+            device_type=None,
         )
 
     def validate_tensor(self, tensor: torch.Tensor, shape_env: ShapeEnv, batch_size: int) -> None:
